@@ -1,0 +1,316 @@
+---
+title: "Esercitazione individuale · FASTQ e analisi della qualità"
+subtitle: "Statistical Models for Genetics · take-home · 2-3 ore"
+author: "Cognome Nome · matricola"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4, fig.align = "center"
+)
+set.seed(1234)   # NON cambiate il seed: tutti devono produrre gli stessi numeri
+```
+
+# Istruzioni · leggere prima di iniziare
+
+**Tempo stimato:** 2-3 ore. Se ne impiegate molto di più, fermatevi e chiedete.
+
+**Cosa consegnare:** un singolo file HTML prodotto da `knit` di questo `.Rmd`, rinominato `Cognome_Nome_homework.html`. Allegare anche il `.Rmd` sorgente. Inviare via email entro la data indicata sul portale del corso.
+
+**Regole:**
+
+1. **Non cambiate il seed.** È fissato a 1234 nel chunk setup. Tutti gli studenti devono produrre gli stessi numeri così le risposte sono confrontabili.
+2. **Compilate i chunk dove vedete `# ... vostro codice qui ...`**. Sono già pronti, dovete solo riempirli.
+3. **Le domande in prosa** (📝) richiedono risposte scritte di 3-5 frasi sotto il chunk corrispondente. Sono il **70% del voto** — il codice è valutato solo se gira; il ragionamento statistico è il punto centrale.
+4. **Niente collaborazione su domande in prosa.** Sul codice potete confrontarvi, ma il testo va scritto da soli.
+5. Se R vi dà errori che non capite, **incollate l'errore nel messaggio email** e chiedete, non bloccatevi.
+
+**Cosa NON serve:** scaricare dati da SRA, installare Bioconductor, fare allineamenti. Tutto gira con `ggplot2`, `dplyr`, `tidyr`. I dati sono simulati nel file stesso.
+
+---
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+})
+```
+
+# Esercizio 1 · Profilo di qualità e filtro a soglia (45 min)
+
+## 1.1 · Il dato
+
+Abbiamo simulato 3000 reads paired-end di 150 bp ciascuno, da una libreria Illumina realistica. Eseguite il chunk seguente — non modificatelo.
+
+```{r exercise1_data}
+simulate_illumina <- function(n_reads, read_len, mean_profile_shape = "normal") {
+  pos <- seq_len(read_len)
+
+  q_profile <- switch(mean_profile_shape,
+    "normal" = {
+      # Q sale rapidamente, plateau ~Q37, decresce dolcemente verso fine read
+      38 - 6 * dnorm(pos, mean = 5, sd = 8) / dnorm(5, 5, 8) -
+        (pos / read_len)^2 * 8
+    },
+    "degraded" = {
+      # Run "cattivo": parte ok, ma crolla rapidamente
+      36 - (pos / read_len)^2 * 22
+    }
+  )
+  q_profile <- pmax(2, pmin(40, q_profile))
+
+  Q <- matrix(
+    pmax(2, pmin(40, round(rnorm(n_reads * read_len,
+                                  mean = rep(q_profile, each = n_reads),
+                                  sd = 3.5)))),
+    nrow = n_reads, ncol = read_len
+  )
+  list(qual_matrix = Q, profile = q_profile)
+}
+
+run_good <- simulate_illumina(3000, 150, "normal")
+run_bad  <- simulate_illumina(3000, 150, "degraded")
+```
+
+Avete due "run" simulati: `run_good` (qualità tipica) e `run_bad` (run problematico). Ognuno è una matrice 3000 × 150 di Phred score.
+
+## 1.2 · Confronto visivo dei due profili
+
+**Task 1.2.a · 10 min.** Costruite un singolo `ggplot` che mostra il **profilo medio di Q per posizione** dei due run, con due linee colorate (una per run) e una banda interquartile attorno a ciascuna media.
+
+Suggerimento: portate le due matrici in long format con `pivot_longer`, calcolate per ogni `(run, position)` la media, il primo e il terzo quartile, poi plottate con `geom_ribbon` + `geom_line`.
+
+```{r solution_1_2_a, eval = FALSE, echo = TRUE}
+# ... vostro codice qui ...
+# Il risultato deve essere un grafico con asse X = posizione, asse Y = Q,
+# due linee colorate (good vs bad) e bande interquartili.
+```
+
+**📝 Domanda 1.2.a.** In 3-4 frasi: a quale posizione lungo il read i due profili divergono di più? Provate a quantificare la divergenza (es. "la differenza media tra Q_good e Q_bad nella seconda metà del read è circa X unità Q, che corrisponde a un rapporto di tassi di errore di Y").
+
+---
+
+## 1.3 · L'effetto del filtro Q ≥ 20
+
+In ogni pipeline FASTQ il primo filtro applicato dopo la QC iniziale è la soglia di qualità per base. Vediamo cosa fa quantitativamente.
+
+**Task 1.3.a · 15 min.** Per ciascun run, calcolate:
+
+1. La **frazione di basi sotto Q20** per ogni posizione (vettore di lunghezza 150).
+2. La **frazione di reads** che hanno almeno una base sotto Q20 (un singolo numero).
+3. La **frazione di reads** che, se troncati al primo Q < 20 dal 3', sopravvivono con lunghezza ≥ 100 bp (un singolo numero — è un proxy di quanti reads passerebbero il filtro tipico di Trimmomatic `SLIDINGWINDOW:4:20 MINLEN:100`).
+
+Producete una tabella riassuntiva.
+
+```{r solution_1_3_a, eval = FALSE, echo = TRUE}
+# ... vostro codice qui ...
+# Output: data.frame con righe = {good, bad} e colonne = {frac_basi_lowQ,
+#         frac_reads_almeno_una_lowQ, frac_reads_sopravvissuti}
+```
+
+**📝 Domanda 1.3.a.** Cosa vi dice la tabella sulla "scelta" implicita del filtro Q ≥ 20? È un filtro **conservativo** (rimuove poco anche se la qualità è bassa) o **aggressivo** (rimuove molto anche su qualità buone)? Discutete in 4-5 frasi, citando i numeri della tabella.
+
+---
+
+## 1.4 · Il punto statistico
+
+**📝 Domanda 1.4.** Il filtro `Q ≥ 20` è il default di Trimmomatic, fastp, bbduk. È trattato come una soglia "universale". Sulla base di quello che avete appena calcolato, è davvero universale? **Quali sono le assunzioni implicite** che un ricercatore fa quando applica `Q ≥ 20` senza riflettere? Citate almeno due assunzioni e per ciascuna spiegate quando potrebbe essere violata. (5-7 frasi)
+
+---
+
+# Esercizio 2 · Una variante del test di calibrazione (60 min)
+
+## 2.1 · Il setup
+
+In aula abbiamo testato un basecaller **ottimista** (dichiara Q più alti del vero). In questo esercizio testate un basecaller **eterogeneo**: la calibrazione dipende dal contesto di sequenza.
+
+Eseguite il chunk seguente — è la simulazione, non modificatelo.
+
+```{r exercise2_data}
+simulate_context_dependent <- function(n_reads = 4000, read_len = 60) {
+  bases <- c("A", "C", "G", "T")
+
+  out <- vector("list", n_reads)
+  for (i in seq_len(n_reads)) {
+    true_seq <- sample(bases, read_len, replace = TRUE)
+
+    # Q vero uniforme tra 15 e 38
+    Q_true <- sample(15:38, read_len, replace = TRUE)
+
+    # Errore reale: tasso base 10^(-Q_true/10), MOLTIPLICATO per 3 se il contesto
+    # locale (3 basi precedenti) è GGG o CCC (omopolimero/contesto difficile)
+    P_err_base <- 10^(-Q_true / 10)
+    multiplier <- rep(1, read_len)
+    for (k in 4:read_len) {
+      context <- paste(true_seq[(k-3):(k-1)], collapse = "")
+      if (context %in% c("GGG", "CCC")) multiplier[k] <- 3
+    }
+    P_err <- pmin(0.5, P_err_base * multiplier)
+    is_error <- runif(read_len) < P_err
+
+    read_seq <- true_seq
+    if (any(is_error)) {
+      for (j in which(is_error)) {
+        read_seq[j] <- sample(setdiff(bases, true_seq[j]), 1)
+      }
+    }
+
+    out[[i]] <- data.frame(
+      read_id = i,
+      position = seq_len(read_len),
+      true_base = true_seq,
+      read_base = read_seq,
+      context_left = c(NA, NA, NA, sapply(4:read_len, function(k)
+        paste(true_seq[(k-3):(k-1)], collapse = ""))),
+      Q_declared = Q_true,         # il basecaller dichiara Q_true
+      is_error = is_error
+    )
+  }
+  do.call(rbind, out)
+}
+
+calib_data <- simulate_context_dependent(n_reads = 4000, read_len = 60)
+head(calib_data, 5)
+```
+
+Il basecaller dichiara `Q_declared` per ogni base. Voi sapete cosa è successo davvero. La domanda è: **il Q dichiarato è calibrato in tutti i contesti?**
+
+## 2.2 · Calibrazione globale (ignorando il contesto)
+
+**Task 2.2.a · 10 min.** Costruite il classico plot di calibrazione: per ogni valore di `Q_declared`, calcolate il tasso di errore osservato e plottate `Q_observed` vs `Q_declared`. Aggiungete la diagonale di riferimento.
+
+```{r solution_2_2_a, eval = FALSE, echo = TRUE}
+# ... vostro codice qui ...
+# Output: ggplot con punti, linea diagonale tratteggiata, eventualmente
+#         dimensione dei punti proporzionale al numero di basi per gruppo
+```
+
+**📝 Domanda 2.2.a.** Il basecaller sembra calibrato globalmente? In 2-3 frasi: i punti stanno sulla diagonale? Se sì, vi fidereste della calibrazione?
+
+---
+
+## 2.3 · Calibrazione stratificata per contesto
+
+Adesso il punto interessante. Ripetete l'analisi ma **separando i due contesti**: omopolimero (GGG o CCC nelle 3 basi precedenti) vs tutto il resto.
+
+**Task 2.3.a · 15 min.** Producete **due plot affiancati**: uno per il contesto "normale", uno per il contesto "omopolimero". In ciascuno, la diagonale di riferimento e i punti di calibrazione.
+
+```{r solution_2_3_a, eval = FALSE, echo = TRUE}
+# ... vostro codice qui ...
+# Suggerimento: aggiungete una colonna `context_type` che vale "homopolymer"
+# se context_left è "GGG" o "CCC", altrimenti "normal". Poi facet_wrap o
+# patchwork per affiancare i due plot.
+```
+
+**📝 Domanda 2.3.a.** Cosa vedete? Quantificate la miscalibrazione nei due contesti: in unità di Q, quanto mente il basecaller in contesto omopolimero rispetto al contesto normale?
+
+---
+
+## 2.4 · La morale statistica
+
+**📝 Domanda 2.4.** L'esercizio 2.2 vi diceva che il basecaller era calibrato. L'esercizio 2.3 vi ha mostrato che non lo è — è solo che il problema si manifesta in una minoranza di basi (quelle in contesto omopolimero). Questo è un classico fenomeno di **Simpson's paradox** applicato alla calibrazione.
+
+Rispondete in 5-7 frasi a queste due domande:
+
+(a) Perché la calibrazione globale "media via" il problema?
+
+(b) Quale conseguenza ha questo per chi fa chiamata di varianti? Pensate al caso di una variante che cade in una regione omopolimerica (es. un indel in una corsa di G).
+
+---
+
+# Esercizio 3 · Lettura critica di un report MultiQC (45 min)
+
+## 3.1 · I dati
+
+Nel materiale del corso trovate il file `multiqc_report.html` (10 campioni Illumina di metagenomica del microbiota + un campione artefatto chiamato `duplicated-reads`).
+
+**Aprite il file nel browser.** Non c'è codice R da scrivere in questo esercizio — solo analisi visiva e ragionamento.
+
+## 3.2 · Tabella di lettura
+
+Compilate la seguente tabella **per i 6 plot indicati** (potete scriverla a mano sul `.Rmd` come testo, oppure usare un `tibble::tribble` se preferite). Per ogni plot:
+
+- **Cosa vedete:** descrizione oggettiva di 1-2 frasi.
+- **Ipotesi nulla implicita:** quale assunzione il plot sta testando.
+- **Decisione a valle:** se ci fosse un problema, cosa fareste (tenere, trimmare, escludere il campione).
+
+I 6 plot da analizzare:
+
+1. General Statistics (la tabella in cima)
+2. Sequence Quality Histograms (Per-sequence quality scores)
+3. Per Base Sequence Quality
+4. Per Sequence GC Content
+5. Sequence Duplication Levels
+6. Adapter Content
+
+**Spazio per le risposte:**
+
+```{r exercise3_template, eval = FALSE, echo = TRUE}
+# Esempio di formattazione (sostituite con le vostre risposte):
+risposte_3_2 <- tibble::tribble(
+  ~plot,                   ~cosa_vedo,                            ~ipotesi_nulla,                            ~decisione,
+  "General Statistics",    "10 campioni + 1 outlier...",          "Campioni comparabili...",                 "Escluderei il campione X perché...",
+  # ... compilate le altre 5 righe ...
+)
+```
+
+---
+
+## 3.3 · La domanda interpretativa finale
+
+**📝 Domanda 3.3.** Immaginate che questi 10 campioni siano controlli sani di un **GWAS su un fenotipo umano** (ignorate per un momento che siano metagenomici). Sulla base dei plot del report MultiQC, **scegliereste tutti i 10 campioni per il GWAS?**
+
+Rispondete in 8-10 frasi, articolate così:
+
+(a) Quale **criterio di QC** standard usereste? (es. soglie su call rate, het rate, duplication, contaminazione)
+
+(b) Dei 10 campioni, **quanti sopravviverebbero** in base ai numeri del report? Citatene almeno uno che escludereste e spiegate perché.
+
+(c) Il plot MultiQC **basta** per fare la QC di un GWAS, o è solo il primo passo? Cosa servirebbe vedere in più?
+
+---
+
+# Sintesi · cosa avete imparato
+
+Compilate brevemente (2-3 frasi per punto):
+
+**📝 Take-home 1.** Il filtro Q ≥ 20 è...
+
+```
+# ... vostra risposta ...
+```
+
+**📝 Take-home 2.** La calibrazione di un classificatore probabilistico (e il Phred lo è) si testa...
+
+```
+# ... vostra risposta ...
+```
+
+**📝 Take-home 3.** I plot di FastQC/MultiQC non sono diagnostici "rituali" ma...
+
+```
+# ... vostra risposta ...
+```
+
+---
+
+## Bibliografia consigliata (non obbligatoria)
+
+- Anders & Huber (2010). *Differential expression analysis for sequence count data*. Genome Biology. → per chi vuole capire perché la binomiale negativa è il modello standard per i conteggi di sequenziamento.
+- Andrews S. *FastQC documentation*. → manuale ufficiale dei plot del report.
+- Anderson et al. (2010). *Data quality control in genetic case-control association studies*. Nature Protocols. → il riferimento canonico per la QC di un GWAS.
+
+---
+
+*Esercitazione individuale · Statistical Models for Genetics · companion del laboratorio in aula `Lab_NGS_R_studente.Rmd`. Consegnare entro la data indicata sul portale.*
