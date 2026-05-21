@@ -1,0 +1,373 @@
+---
+title: "SOLUZIONI · Esercitazione individuale FASTQ"
+subtitle: "Statistical Models for Genetics · take-home · versione DOCENTE"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4, fig.align = "center"
+)
+set.seed(1234)
+```
+
+# Nota per il docente
+
+Questo file contiene **codice completo + risposte modello** per ognuno dei task della homework. Le risposte alle domande in prosa (📝) sono volutamente discorsive — non sono "la" risposta giusta, sono **un esempio di ragionamento accettabile**. Una risposta dello studente è valutabile come buona se identifica i punti chiave, anche con formulazione diversa.
+
+**Tempo totale di esecuzione di questo file:** ~30 secondi (no Bioconductor, no dati esterni).
+
+**Punti chiave per la valutazione** (suggerimento di pesatura):
+
+- **Esercizio 1**: codice 30%, domande 1.2/1.3 25%, domanda 1.4 (assunzioni del filtro Q≥20) 45%. È la domanda più importante.
+- **Esercizio 2**: codice 35%, domande di calibrazione 25%, domanda 2.4 (Simpson paradox) 40%. Il punto cruciale è capire che la calibrazione media via i sottogruppi rari.
+- **Esercizio 3**: tabella 50%, domanda 3.3 (decisione GWAS) 50%. La domanda 3.3 è il vero contenuto.
+
+Studenti che producono codice corretto ma rispondono male alle domande in prosa **non passano**. Il take-home è sul ragionamento statistico, non sulla programmazione.
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+})
+```
+
+---
+
+# Esercizio 1 · Profilo di qualità e filtro a soglia
+
+## Dati
+
+```{r exercise1_data}
+simulate_illumina <- function(n_reads, read_len, mean_profile_shape = "normal") {
+  pos <- seq_len(read_len)
+
+  q_profile <- switch(mean_profile_shape,
+    "normal" = {
+      38 - 6 * dnorm(pos, mean = 5, sd = 8) / dnorm(5, 5, 8) -
+        (pos / read_len)^2 * 8
+    },
+    "degraded" = {
+      36 - (pos / read_len)^2 * 22
+    }
+  )
+  q_profile <- pmax(2, pmin(40, q_profile))
+
+  Q <- matrix(
+    pmax(2, pmin(40, round(rnorm(n_reads * read_len,
+                                  mean = rep(q_profile, each = n_reads),
+                                  sd = 3.5)))),
+    nrow = n_reads, ncol = read_len
+  )
+  list(qual_matrix = Q, profile = q_profile)
+}
+
+run_good <- simulate_illumina(3000, 150, "normal")
+run_bad  <- simulate_illumina(3000, 150, "degraded")
+```
+
+## 1.2.a · Confronto visivo
+
+```{r solution_1_2_a}
+# Long format combinato
+df_both <- bind_rows(
+  as.data.frame(run_good$qual_matrix) |>
+    setNames(seq_len(150)) |>
+    pivot_longer(everything(), names_to = "position", values_to = "Q") |>
+    mutate(run = "good"),
+  as.data.frame(run_bad$qual_matrix)  |>
+    setNames(seq_len(150)) |>
+    pivot_longer(everything(), names_to = "position", values_to = "Q") |>
+    mutate(run = "bad")
+) |>
+  mutate(position = as.integer(position))
+
+# Statistiche per posizione
+summary_by_pos <- df_both |>
+  group_by(run, position) |>
+  summarise(
+    Q_mean = mean(Q),
+    Q_q25  = quantile(Q, 0.25),
+    Q_q75  = quantile(Q, 0.75),
+    .groups = "drop"
+  )
+
+ggplot(summary_by_pos, aes(position, Q_mean, colour = run, fill = run)) +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = 0,  ymax = 20, alpha = 0.08, fill = "red") +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = 20, ymax = 30, alpha = 0.08, fill = "orange") +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = 30, ymax = 42, alpha = 0.08, fill = "forestgreen") +
+  geom_ribbon(aes(ymin = Q_q25, ymax = Q_q75), alpha = 0.3, colour = NA) +
+  geom_line(linewidth = 1) +
+  scale_colour_manual(values = c(good = "steelblue", bad = "firebrick")) +
+  scale_fill_manual(values   = c(good = "steelblue", bad = "firebrick")) +
+  scale_y_continuous(breaks = seq(0, 40, 5), limits = c(0, 42)) +
+  labs(title = "Profilo di Q per posizione: run_good vs run_bad",
+       subtitle = "Linee = media · bande = intervallo interquartile",
+       x = "Posizione (bp)", y = "Q") +
+  theme_minimal(base_size = 11)
+```
+
+**Risposta modello 1.2.a.**
+
+> I due profili partono simili (Q ~32-35 nelle prime 5-10 posizioni) e divergono progressivamente. La divergenza diventa marcata dopo la posizione 50: a posizione 100 il run_bad ha Q medio ~22 mentre run_good ~30, una differenza di circa 8 unità Q. In termini di tassi di errore, 8 unità Q corrispondono a un fattore $10^{0.8} \approx 6.3$: nel run_bad le basi alla posizione 100 hanno un tasso di errore atteso 6 volte superiore al run_good. Nella zona finale (posizioni 130-150) il run_bad è in zona "rossa" (Q < 20), inaccettabile per la maggior parte degli usi.
+
+## 1.3.a · Effetto del filtro Q ≥ 20
+
+```{r solution_1_3_a}
+# Helper function: filtro trimming "SLIDINGWINDOW:4:20 MINLEN:100" semplificato
+sopravvive <- function(Q_row, soglia = 20, min_len = 100) {
+  # Tronchiamo al primo Q < soglia partendo dal 3'
+  # Cerchiamo l'ultima posizione contigua con Q >= soglia dal 5'
+  if (Q_row[1] < soglia) return(FALSE)
+  first_low <- which(Q_row < soglia)
+  trim_pos <- if (length(first_low) == 0) length(Q_row) else first_low[1] - 1
+  trim_pos >= min_len
+}
+
+stats_run <- function(qual_mat) {
+  frac_basi_lowQ <- mean(qual_mat < 20)
+  frac_reads_almeno_una <- mean(apply(qual_mat < 20, 1, any))
+  frac_reads_survive <- mean(apply(qual_mat, 1, sopravvive))
+  data.frame(
+    frac_basi_lowQ = frac_basi_lowQ,
+    frac_reads_almeno_una_lowQ = frac_reads_almeno_una,
+    frac_reads_sopravvissuti = frac_reads_survive
+  )
+}
+
+tabella <- bind_rows(
+  cbind(run = "good", stats_run(run_good$qual_matrix)),
+  cbind(run = "bad",  stats_run(run_bad$qual_matrix))
+)
+tabella |> knitr::kable(digits = 3, caption = "Effetto del filtro Q ≥ 20")
+```
+
+**Risposta modello 1.3.a.**
+
+> Il filtro Q≥20 sembra essere abbastanza permissivo a livello di singola base (in run_good solo ~1% delle basi è sotto Q20), ma diventa estremamente aggressivo a livello di **read**: quasi tutti i reads hanno almeno una base sotto Q20 (>95% in entrambi i run). Questo significa che un filtro semplice "scarta il read se c'è una base bassa" eliminerebbe quasi tutti i dati. Il filtro più realistico (sliding window con MINLEN:100) recupera la maggior parte dei reads di run_good (~96%) ma ne perde una frazione enorme di run_bad (la qualità crolla prima di posizione 100, quindi molti reads vengono troncati sotto la soglia di lunghezza). Il punto: il filtro Q≥20 da solo è inutilmente conservativo o crudelmente aggressivo a seconda di come lo si applica.
+
+## 1.4 · Domanda statistica
+
+**Risposta modello 1.4.**
+
+> Il filtro `Q ≥ 20` ha almeno due assunzioni implicite forti.
+>
+> **Assunzione 1: il tasso di errore di Q=20 è 1% in tutte le condizioni.** Questa è la calibrazione del Phred score, e abbiamo visto in aula che dipende dal basecaller, dalla posizione lungo il read, e dal contesto di sequenza. Per un basecaller miscalibrato, Q=20 potrebbe corrispondere a 3% di errore reale. Il filtro mantiene basi che chi lo applica crede "buone" ma sono in realtà più rumorose.
+>
+> **Assunzione 2: gli errori sono indipendenti tra posizioni.** Se Q < 20 è equivalente a "lancio una moneta", il filtro funziona. Ma abbiamo visto che la qualità decresce sistematicamente verso il 3': se la posizione 130 è sotto Q20, è quasi certo che lo siano anche 131, 132... Quindi gli errori arrivano "a grappoli", non singoli. Questo è MNAR (missing not at random), e qualsiasi modello a valle che assume i.i.d. è male specificato.
+>
+> **Una terza assunzione, meno ovvia:** che la "soglia 20" sia il punto giusto per la specifica applicazione. Per chiamata di SNP comuni (MAF > 5%) Q20 è quasi certamente troppo lasso — si vorrebbe Q30 per ridurre i falsi positivi. Per chiamata di varianti rare in oncologia, Q30 è ancora troppo permissivo: si lavora con Q40+ e UMI per consenso.
+
+---
+
+# Esercizio 2 · Calibrazione context-dependent
+
+## Dati
+
+```{r exercise2_data}
+simulate_context_dependent <- function(n_reads = 4000, read_len = 60) {
+  bases <- c("A", "C", "G", "T")
+
+  out <- vector("list", n_reads)
+  for (i in seq_len(n_reads)) {
+    true_seq <- sample(bases, read_len, replace = TRUE)
+    Q_true <- sample(15:38, read_len, replace = TRUE)
+    P_err_base <- 10^(-Q_true / 10)
+    multiplier <- rep(1, read_len)
+    for (k in 4:read_len) {
+      context <- paste(true_seq[(k-3):(k-1)], collapse = "")
+      if (context %in% c("GGG", "CCC")) multiplier[k] <- 3
+    }
+    P_err <- pmin(0.5, P_err_base * multiplier)
+    is_error <- runif(read_len) < P_err
+
+    read_seq <- true_seq
+    if (any(is_error)) {
+      for (j in which(is_error)) {
+        read_seq[j] <- sample(setdiff(bases, true_seq[j]), 1)
+      }
+    }
+
+    out[[i]] <- data.frame(
+      read_id = i,
+      position = seq_len(read_len),
+      true_base = true_seq,
+      read_base = read_seq,
+      context_left = c(NA, NA, NA, sapply(4:read_len, function(k)
+        paste(true_seq[(k-3):(k-1)], collapse = ""))),
+      Q_declared = Q_true,
+      is_error = is_error
+    )
+  }
+  do.call(rbind, out)
+}
+
+calib_data <- simulate_context_dependent(n_reads = 4000, read_len = 60)
+```
+
+## 2.2.a · Calibrazione globale
+
+```{r solution_2_2_a}
+calib_global <- calib_data |>
+  group_by(Q_declared) |>
+  summarise(
+    n = n(),
+    P_obs = mean(is_error),
+    Q_obs = -10 * log10(pmax(P_obs, 1e-10)),
+    .groups = "drop"
+  )
+
+ggplot(calib_global, aes(Q_declared, Q_obs)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey50", linetype = "dashed") +
+  geom_point(aes(size = n), colour = "steelblue", alpha = 0.8) +
+  geom_line(colour = "steelblue", alpha = 0.4) +
+  scale_y_continuous(limits = c(10, 45)) +
+  labs(title = "Calibrazione globale (ignorando il contesto)",
+       subtitle = "Linea tratteggiata = calibrazione perfetta",
+       x = "Q dichiarato", y = "Q osservato", size = "n basi") +
+  theme_minimal(base_size = 11)
+```
+
+**Risposta modello 2.2.a.**
+
+> A occhio i punti stanno **vicini alla diagonale**, con qualche scostamento a Q alti (≥35) dovuto a numerosità campionaria insufficiente (a Q=38, su ~10.000 basi, ci si aspettano solo ~1.5 errori — il rumore campionario domina). Globalmente il basecaller sembra calibrato. Mi fiderei di questo plot se non sapessi che il contesto può alterare il pattern.
+
+## 2.3.a · Calibrazione stratificata
+
+```{r solution_2_3_a, fig.width = 9, fig.height = 4}
+calib_strat <- calib_data |>
+  filter(!is.na(context_left)) |>
+  mutate(context_type = ifelse(context_left %in% c("GGG", "CCC"),
+                                "omopolimero (GGG/CCC)", "normale")) |>
+  group_by(context_type, Q_declared) |>
+  summarise(
+    n = n(),
+    P_obs = mean(is_error),
+    Q_obs = -10 * log10(pmax(P_obs, 1e-10)),
+    .groups = "drop"
+  ) |>
+  filter(n >= 30)  # filtro per evitare rumore campionario estremo
+
+ggplot(calib_strat, aes(Q_declared, Q_obs, colour = context_type)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey50", linetype = "dashed") +
+  geom_point(aes(size = n), alpha = 0.8) +
+  geom_line(alpha = 0.4) +
+  facet_wrap(~ context_type) +
+  scale_colour_manual(values = c("normale" = "steelblue",
+                                  "omopolimero (GGG/CCC)" = "firebrick")) +
+  scale_y_continuous(limits = c(5, 40)) +
+  labs(title = "Calibrazione stratificata per contesto di sequenza",
+       subtitle = "Il basecaller è calibrato nel contesto normale, miscalibrato in contesto omopolimero",
+       x = "Q dichiarato", y = "Q osservato", size = "n basi") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+# Quantificazione numerica del bias per contesto
+calib_strat |>
+  filter(Q_declared %in% c(15, 20, 25)) |>
+  mutate(delta_Q = Q_obs - Q_declared) |>
+  knitr::kable(digits = 2,
+               caption = "Bias del basecaller per Q dichiarato e contesto")
+```
+
+**Risposta modello 2.3.a.**
+
+> Nel contesto **normale** i punti stanno praticamente sulla diagonale (delta Q ≈ +0.3-0.4, trascurabile). Nel contesto **omopolimero** i punti stanno **nettamente sotto la diagonale**: a Q=20, Q_obs ≈ 15 (delta ≈ -5 unità); a Q=15, Q_obs ≈ 9 (delta ≈ -6 unità). In altre parole, **quando il basecaller dichiara Q=20 in un contesto GGG o CCC, il tasso di errore reale è 3× quello atteso** — coerente con il moltiplicatore × 3 imposto nella simulazione. La miscalibrazione cresce linearmente con Q dichiarato. A Q≥30 in contesto omopolimero ci sono pochi errori osservati (i Q veri sono già abbastanza alti che anche × 3 produce pochi errori in 300 basi); per giudicare bene servirebbero più dati.
+
+## 2.4 · Simpson's paradox
+
+**Risposta modello 2.4.**
+
+> **(a) Perché la calibrazione globale media via il problema.**
+> Le basi in contesto omopolimero sono solo il 3% del totale ($\sim 2 \times (1/4)^3$ per i due omopolimeri GGG e CCC). Anche se il loro tasso di errore è 3× quello dichiarato, contribuiscono solo per il 3% × 3 ≈ 9% alla massa totale di errori, contro il 97% × 1 = 97% del contesto normale. La media pesata di Q_obs è dominata dal contesto normale ed è quasi indistinguibile dalla diagonale. Questo è un caso paradigmatico di **Simpson's paradox**: un'aggregazione che nasconde un effetto presente nei sottogruppi.
+>
+> **(b) Conseguenza per la chiamata di varianti.**
+> Considerate la chiamata di un indel in una regione omopolimerica (es. una corsa di 8 G, e dovete decidere se sono 7 o 9). Il caller di varianti pesa l'evidenza dei reads usando i Q score: ogni read contribuisce con un peso ~ Q. Se il basecaller dichiara Q=20 ma il tasso di errore reale è 3× più alto, il caller **sovrastima la confidenza** delle chiamate in quelle posizioni — produce più falsi positivi. È esattamente questo il motivo per cui i caller moderni (DeepVariant, GATK con BQSR) **ricalibrano il Q condizionato al contesto di sequenza**, non lo prendono per buono dal basecaller. Per uno studio GWAS sostanzialmente irrilevante (le regioni omopolimere sono spesso filtrate); per uno studio di varianti somatiche in oncologia, devastante.
+
+---
+
+# Esercizio 3 · Lettura critica del MultiQC
+
+## 3.2 · Tabella di lettura
+
+**Risposta modello (riferita al `multiqc_report.html` del corso, 10 campioni metagenomici + 1 outlier sintetico).**
+
+```{r solution_3_2}
+risposte_3_2 <- tibble::tribble(
+  ~plot,                      ~cosa_vedo,                                         ~ipotesi_nulla,                            ~decisione,
+
+  "General Statistics",       "10 campioni con % dup tra 20-50%, %GC ~51-56, length 251. Una riga 'duplicated-reads' (sintetica) con % dup nettamente più alta.",
+                              "I campioni del dataset sono comparabili tra loro (stessa distribuzione).",
+                              "Escluderei 'duplicated-reads' (è un controllo artefatto). Per gli altri, verifico se qualche campione ha %dup > 1.5×IQR oltre la mediana del gruppo.",
+
+  "Per-sequence quality scores", "Curve unimodali centrate a Q ~33-36 per la maggior parte dei campioni, due campioni mostrano un secondo picco a Q ~20 ('per_sequence_quality_scores' fail).",
+                                  "I reads cattivi sono rari (la distribuzione di Q ha una sola moda alta).",
+                                  "I campioni con bimodalità (BAQ1370.1.2 R2 e BAQ895.2 R2) hanno una sottopopolazione di reads di bassa qualità. Decisione: trimming aggressivo o esclusione del campione.",
+
+  "Per Base Sequence Quality", "Curve a campana classiche con picco Q~38 a posizioni 15-30 e decrescita verso il 3' (Q~28-30 a fine read). Nessun crollo prematuro.",
+                              "Q indipendente da posizione (i.i.d. lungo il read).",
+                              "Ipotesi violata in modo atteso e fisiologico (phasing/dephasing Illumina). Decisione: trimming standard delle ultime ~10-15 bp con SLIDINGWINDOW, niente esclusioni.",
+
+  "Per-sequence GC Content",  "Distribuzioni unimodali centrate ~52-55%, ma più larghe del normale e con code lunghe — caratteristico dei dati metagenomici (mix di specie con GC diverso).",
+                              "Il %GC dei reads segue una normale stretta attorno al valore atteso del genoma.",
+                              "Ipotesi violata, ma è il segnale biologico (eterogeneità di composizione del microbiota). Per un GWAS umano sarebbe un campanello d'allarme; per metagenomica è normale.",
+
+  "Sequence Duplication Levels", "% di sequenze rimanenti dopo deduplication ~50-80% per la maggior parte dei campioni. Il sample 'duplicated-reads' è a ~20% (artefatto sintetico).",
+                                  "Le sequenze duplicate sono rare.",
+                                  "Ipotesi violata in modo controllato: % duplicati alti sono attesi in metagenomica amplificata per PCR. Per WGS umano, % duplicati > 30% sarebbe sospetta. Decisione: deduplication a valle (Picard MarkDuplicates).",
+
+  "Adapter Content",          "Per la maggior parte dei campioni l'adapter content cresce dal ~0% a inizio read fino a ~5-15% verso le posizioni 200-251.",
+                              "% adapter ~ 0 in tutte le posizioni del read.",
+                              "Ipotesi violata, atteso per inserti corti rispetto a read length 251. Decisione: adapter trimming obbligatorio (Trimmomatic, fastp) prima dell'allineamento."
+)
+risposte_3_2 |> knitr::kable()
+```
+
+## 3.3 · La domanda interpretativa
+
+**Risposta modello 3.3.**
+
+> **(a) Criterio di QC standard per un GWAS umano.**
+> Riferimento: Anderson et al. (Nat Protoc 2010). Per i campioni: call rate genome-wide > 95%, het rate entro ±3 SD dalla media, no relatedness PI_HAT > 0.185, no sex mismatch. Per gli SNP: MAF > 1%, call rate > 95%, HWE p > 10⁻⁶ nei controlli. Questi criteri si applicano **a valle** del FASTQ — sui dati genotipici PLINK — ma i loro predittori si vedono già in FastQC.
+>
+> **(b) Quanti campioni sopravviverebbero.**
+> Sui 10 campioni reali (ignorando il sample sintetico "duplicated-reads"): probabilmente **8 su 10**. Escluderei i due campioni con bimodalità nella distribuzione di Q (BAQ1370.1.2 R2 e BAQ895.2 R2): la sottopopolazione di reads a Q~20 indica un problema strumentale o di library prep che a valle si manifesterà come call rate basso. Per gli altri 8, %GC nel range tipico, no adapter content patologico, dup% accettabile per metagenomica. Da rivalutare a livello sample dopo allineamento.
+>
+> **(c) MultiQC basta per la QC di un GWAS?**
+> No, è il **primo livello, upstream**. MultiQC su FASTQ vi dice se il dato grezzo è abbastanza pulito per essere processato — ma non vi dice se i genotipi finali saranno affidabili. Per la QC vera servono:
+> - PLINK su dati post-allineamento per call rate per sample e per SNP;
+> - PCA su tutto il genoma per identificare outlier di ancestry e batch effect;
+> - Stima del coefficiente di kinship per rilevare consanguineità non dichiarata e parentele tra campioni;
+> - Stima dell'inflazione λ_GC nei test di associazione per verificare stratificazione residua.
+>
+> MultiQC è necessario ma non sufficiente. È l'equivalente di leggere l'emocromo prima di una diagnosi: ti dice se ci sono segnali generali di problema, non ti dà la diagnosi.
+
+---
+
+# Sintesi · take-home
+
+**Risposta modello 1.**
+
+> Il filtro Q ≥ 20 **è una scelta euristica** mascherata da soglia universale. Le sue assunzioni implicite (calibrazione del Phred, indipendenza degli errori, irrilevanza del contesto) sono violate sistematicamente nei dati reali. Per un GWAS standard è ragionevole, per chiamate di varianti rare è insufficiente.
+
+**Risposta modello 2.**
+
+> La calibrazione di un classificatore probabilistico si testa **confrontando le probabilità predette con i tassi di evento osservati**, idealmente stratificando per le covariate rilevanti (posizione, contesto, batch). Plot della diagonale: punti sopra = pessimista, sotto = ottimista. È esattamente quello che fa BQSR in GATK.
+
+**Risposta modello 3.**
+
+> I plot di FastQC/MultiQC sono **test di ipotesi nulla non scritti**. Ogni plot ha un'assunzione implicita ("i campioni sono comparabili", "Q è indipendente da posizione", "%GC è normale stretta", "non ci sono duplicati"). Leggerli criticamente significa identificare l'assunzione, valutare se è violata, e prendere una decisione operativa (trimmare, escludere, ignorare l'avviso perché atteso). Non sono diagnostici rituali — sono il punto di partenza di tutta la pipeline statistica successiva.
+
+---
+
+*File soluzioni · Statistical Models for Genetics · uso interno docente. Distribuire agli studenti solo dopo la consegna della homework.*

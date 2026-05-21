@@ -1,0 +1,476 @@
+---
+title: "Lezione 1 — Demo R"
+subtitle: "MAF, HWE e LD su chr10 di 1000 Genomes"
+author: "Statistical Models for Genetics"
+date: "Master in Biostatistica"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    theme: paper
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 8, fig.height = 5, fig.align = "center",
+  dpi = 100
+)
+set.seed(20260101)
+```
+
+# Premessa operativa
+
+Questa demo è lo scheletro che rifaremo sul dataset reale T2D / chr10 di 1000 Genomes. Per renderla auto-contenuta e renderizzabile ovunque, qui generiamo un **piccolo dataset sintetico** che imita la struttura del dato reale (1000G chr10, ~2.500 individui, ~2 milioni di SNP). Nel laboratorio basterà sostituire la sezione "Caricamento dati" con il path al file PLINK vero che vi verrà fornito — il resto del codice resta identico.
+
+**Pacchetti utilizzati nel laboratorio reale:**
+
+- `genio` — lettura di file PLINK in R
+- `snpStats` — ispezione, MAF, HWE
+- `LDheatmap` — visualizzazione LD
+- `ggplot2` + `dplyr` — manipolazione e grafici
+
+In questa demo, **simuliamo** la matrice di genotipi direttamente in R, così non servono dipendenze esterne pesanti per la renderizzazione delle slide.
+
+```{r libraries}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+theme_set(theme_minimal(base_size = 13))
+```
+
+---
+
+# 1. Caricamento dei dati (versione lab vs versione demo)
+
+## Versione **lab reale** 
+
+Nel laboratorio con i dati reali i dati vanno caricati così:
+
+```r
+# --- Lab reale: dati T2D 1000G chr10 ---
+library(genio)
+plink_path <- "data/T2D_chr10"   # path del trio .bed/.bim/.fam
+dat        <- read_plink(plink_path)
+G          <- dat$X              # matrice n_snp × n_ind di {0, 1, 2, NA}
+bim        <- dat$bim            # info per-SNP
+fam        <- dat$fam            # info per-individuo
+```
+
+## Versione **demo** (auto-contenuta)
+
+Qui simuliamo una matrice di genotipi realistica:
+
+- 1.000 individui (vs ~2.500 nel dato reale)
+- 5.000 SNP su una "finestra di chr10" intorno a TCF7L2 (vs ~2M sul cromosoma intero)
+- frequenze alleliche distribuite come in popolazioni europee
+- iniettiamo un **blocco di LD** centrato su rs7903146 (TCF7L2)
+
+```{r simulate-genotypes}
+n_ind <- 1000
+n_snp <- 5000
+
+# Frequenze alleliche realistiche: mistura di SNP comuni e a bassa frequenza
+maf_true <- c(
+  runif(n_snp * 0.7, 0.05, 0.50),  # 70% comuni
+  runif(n_snp * 0.2, 0.01, 0.05),  # 20% a bassa frequenza
+  runif(n_snp * 0.1, 0.001, 0.01)  # 10% rare
+)
+maf_true <- sample(maf_true, n_snp)
+
+# Posizioni simulate su chr10 (regione ~114.7-114.8 Mb intorno a TCF7L2)
+pos <- sort(round(runif(n_snp, 114000000, 115500000)))
+
+# Genotipi: binomiale(2, p) per ogni SNP (HWE perfetto)
+G <- matrix(NA_integer_, nrow = n_ind, ncol = n_snp)
+for (j in seq_len(n_snp)) {
+  G[, j] <- rbinom(n_ind, size = 2, prob = maf_true[j])
+}
+
+# rownames e colnames realistici
+rownames(G) <- sprintf("HG%05d", seq_len(n_ind))
+colnames(G) <- sprintf("rs%07d", seq_len(n_snp))
+
+# Iniettiamo un blocco LD intorno a una posizione "TCF7L2-like"
+tcf7l2_idx     <- which.min(abs(pos - 114758349))
+tcf7l2_rsid    <- colnames(G)[tcf7l2_idx]
+ld_block_idx   <- (tcf7l2_idx - 25):(tcf7l2_idx + 25)
+ld_block_idx   <- ld_block_idx[ld_block_idx >= 1 & ld_block_idx <= n_snp]
+
+# Per gli SNP nel blocco, ricopio il segnale di TCF7L2 con rumore decrescente
+# → genera LD r² alta sotto i 50 kb
+for (j in ld_block_idx) {
+  if (j == tcf7l2_idx) next
+  dist_units <- abs(j - tcf7l2_idx)
+  noise_p    <- 0.5 * (1 - exp(-dist_units / 8))  # 0% rumore al centro, ~50% al bordo
+  swap       <- rbinom(n_ind, 1, noise_p) == 1
+  G[, j]     <- ifelse(swap, rbinom(n_ind, 2, maf_true[j]), G[, tcf7l2_idx])
+}
+
+# Rinomino il SNP centrale per chiarezza didattica
+colnames(G)[tcf7l2_idx] <- "rs7903146"
+tcf7l2_rsid <- "rs7903146"
+
+# Tabelle .bim e .fam simulate per coerenza con il lab reale
+bim <- data.frame(
+  chr  = 10L,
+  rsID = colnames(G),
+  cM   = 0,
+  pos  = pos,
+  A1   = "T",
+  A2   = "C",
+  stringsAsFactors = FALSE
+)
+
+fam <- data.frame(
+  FID   = rownames(G),
+  IID   = rownames(G),
+  pat   = 0,
+  mat   = 0,
+  sex   = sample(1:2, n_ind, replace = TRUE),
+  pheno = sample(1:2, n_ind, replace = TRUE),
+  stringsAsFactors = FALSE
+)
+
+dim(G)
+```
+
+---
+
+# 2. Ispezione di `.bim` e `.fam`
+
+## `.bim` — informazioni per-SNP
+
+```{r bim-head}
+head(bim, 10)
+```
+
+**Cosa stiamo guardando**: ogni riga è uno SNP. Le colonne sono cromosoma, identificativo (rsID), distanza in centiMorgan (di solito 0), posizione fisica in basi, e i due alleli (A1 = di solito l'allele *alternativo*, A2 = il *reference*).
+
+**Domanda:** *"questa è la regione di TCF7L2 — sapete riconoscere la posizione canonica di rs7903146?"*
+
+```{r tcf7l2-pos}
+bim[bim$rsID == "rs7903146", ]
+```
+
+## `.fam` — informazioni per-individuo
+
+```{r fam-head}
+head(fam, 10)
+```
+
+**Codifica del fenotipo (caso-controllo):**
+
+- `1` = controllo
+- `2` = caso
+- `-9` o `0` = mancante
+
+**Distribuzione casi/controlli nel nostro dataset:**
+
+```{r case-control-table}
+table(fam$pheno, dnn = "pheno")
+```
+
+(Per ora il fenotipo è simulato in modo *neutro*. Il segnale T2D verrà iniettato nel dataset reale del laboratorio.)
+
+---
+
+# 3. Frequenze alleliche e MAF
+
+La frequenza dell'allele alternativo è la **media della colonna di $G$ divisa per 2**:
+
+```{r maf-compute}
+# Frequenza dell'allele alternativo
+freq_alt <- colMeans(G, na.rm = TRUE) / 2
+
+# MAF = min(p, 1-p)
+maf <- pmin(freq_alt, 1 - freq_alt)
+
+summary(maf)
+```
+
+## Spettro delle frequenze alleliche
+
+Lo spettro è il grafico più informativo di un dataset GWAS: ci dice **quanti SNP comuni** abbiamo e dove si concentra la massa.
+
+```{r maf-spectrum, fig.cap="Spettro della MAF: ~70% degli SNP sono comuni (MAF ≥ 0.05)"}
+library(ggplot2)
+ggplot(data.frame(maf = maf), aes(x = maf)) +
+  geom_histogram(bins = 50, fill = "#2c7fb8", color = "white") +
+  geom_vline(xintercept = c(0.01, 0.05), linetype = "dashed", color = "red") +
+  annotate("text", x = 0.06, y = Inf, label = "MAF = 0.05",
+           color = "red", vjust = 1.5, hjust = 0, size = 3.5) +
+  annotate("text", x = 0.02, y = Inf, label = "MAF = 0.01",
+           color = "red", vjust = 3, hjust = 0, size = 3.5) +
+  labs(
+    x = "MAF", y = "Numero di SNP",
+    title = "Spettro della Minor Allele Frequency",
+    subtitle = paste0("Dataset demo: ", n_snp, " SNP, ", n_ind, " individui")
+  )
+```
+
+**Interpretazione in aula:**
+
+- la **massa principale** è tra 0.05 e 0.50 → questi sono gli SNP "comuni"
+- la **coda a sinistra** sotto 0.05 contiene gli SNP a bassa frequenza/rari → tipicamente esclusi nel filtro di QC
+- la forma a U *non* è quella che si vede di solito (le frequenze nei chip sono spesso tagliate a MAF > 0.01) — il nostro dataset simulato è più ricco di varianti rare
+
+## Tabella riassuntiva per categoria
+
+```{r maf-categories}
+maf_class <- cut(maf,
+  breaks = c(-Inf, 0.01, 0.05, 0.5),
+  labels = c("rare (<1%)", "bassa freq. (1-5%)", "comuni (≥5%)")
+)
+table(maf_class)
+```
+
+---
+
+# 4. Equilibrio di Hardy–Weinberg
+
+## Calcolo manuale del test χ² (un solo SNP)
+
+Riprendiamo il SNP TCF7L2 (rs7903146) e calcoliamo HWE *a mano*, per fissare l'algebra:
+
+```{r hwe-manual}
+g     <- G[, "rs7903146"]
+n     <- sum(!is.na(g))
+
+# Conteggi genotipici osservati
+o_AA  <- sum(g == 0, na.rm = TRUE)
+o_Aa  <- sum(g == 1, na.rm = TRUE)
+o_aa  <- sum(g == 2, na.rm = TRUE)
+
+# Frequenza allelica
+p     <- (2 * o_AA + o_Aa) / (2 * n)
+q     <- 1 - p
+
+# Frequenze attese sotto HWE
+e_AA  <- n * p^2
+e_Aa  <- n * 2 * p * q
+e_aa  <- n * q^2
+
+# Statistica χ²
+X2    <- (o_AA - e_AA)^2 / e_AA +
+         (o_Aa - e_Aa)^2 / e_Aa +
+         (o_aa - e_aa)^2 / e_aa
+
+p_val <- pchisq(X2, df = 1, lower.tail = FALSE)
+
+data.frame(
+  conteggio  = c("AA", "Aa", "aa", "n", "p", "X²", "p-value"),
+  osservato  = c(o_AA, o_Aa, o_aa, n, "", "", ""),
+  atteso_HWE = c(round(e_AA,1), round(e_Aa,1), round(e_aa,1), n,
+                 round(p,3), round(X2,3), formatC(p_val, digits = 3))
+)
+```
+
+## Calcolo vettorializzato su tutti gli SNP
+
+```{r hwe-vectorized}
+# Funzione per HWE p-value su un vettore di genotipi {0,1,2,NA}
+hwe_test <- function(g) {
+  g <- g[!is.na(g)]
+  n <- length(g)
+  if (n < 50) return(NA_real_)  # troppo pochi dati
+  o_AA <- sum(g == 0); o_Aa <- sum(g == 1); o_aa <- sum(g == 2)
+  p <- (2 * o_AA + o_Aa) / (2 * n)
+  q <- 1 - p
+  if (p == 0 || q == 0) return(NA_real_)
+  e_AA <- n * p^2; e_Aa <- n * 2 * p * q; e_aa <- n * q^2
+  X2 <- (o_AA - e_AA)^2 / e_AA +
+        (o_Aa - e_Aa)^2 / e_Aa +
+        (o_aa - e_aa)^2 / e_aa
+  pchisq(X2, df = 1, lower.tail = FALSE)
+}
+
+# Applichiamo a tutti gli SNP (sono 5000)
+hwe_p <- apply(G, 2, hwe_test)
+
+summary(hwe_p)
+```
+
+## Distribuzione dei p-value di HWE
+
+Sotto $H_0$ (HWE vale ovunque) i p-value sono **uniformi su [0, 1]**.
+
+```{r hwe-pvalue-hist, fig.cap="P-value HWE: distribuzione uniforme attesa sotto H₀"}
+ggplot(data.frame(p = hwe_p), aes(x = p)) +
+  geom_histogram(bins = 50, fill = "#fdae61", color = "white") +
+  geom_hline(yintercept = n_snp / 50, linetype = "dashed", color = "red") +
+  labs(
+    x = "p-value HWE", y = "Numero di SNP",
+    title = "Distribuzione dei p-value di Hardy–Weinberg",
+    subtitle = "La linea rossa è il valore atteso sotto H₀ (uniforme)"
+  )
+```
+
+**Interpretazione:**
+
+- distribuzione **piatta** sotto $H_0$ ⇒ il dataset è "pulito" dal punto di vista di HWE
+- un **eccesso vicino a 0** indicherebbe presenza di errori sistematici di genotipizzazione
+- nel dato reale T2D *noisy* (L2) vedremo questo eccesso e lo useremo come filtro
+
+## Quanti SNP filtreremmo a $p < 10^{-6}$?
+
+Soglia GWAS standard:
+
+```{r hwe-filter-count}
+sum(hwe_p < 1e-6, na.rm = TRUE)
+```
+
+Con un dataset simulato pulito ne aspettiamo praticamente zero. Nel dato reale T2D ne vedremo qualche centinaio — ed è esattamente quello che il filtro HWE serve a togliere.
+
+---
+
+# 5. Linkage Disequilibrium
+
+## Calcolo di r² tra due SNP
+
+Definizione operativa: $r^2$ è il **quadrato della correlazione di Pearson** tra le due colonne di genotipi.
+
+```{r ld-manual}
+# Prendiamo TCF7L2 e uno SNP vicino
+snp1 <- G[, "rs7903146"]
+snp2 <- G[, tcf7l2_idx + 1]  # SNP immediatamente adiacente
+
+r  <- cor(snp1, snp2, use = "pairwise.complete.obs")
+r2 <- r^2
+
+cat(sprintf("r²(rs7903146, SNP vicino) = %.3f\n", r2))
+```
+
+**Sanity check:** dato che abbiamo iniettato LD forte nel blocco, ci aspettiamo $r^2$ alto qui — e infatti.
+
+## Decadimento di r² con la distanza
+
+```{r ld-decay, fig.cap="Decadimento dell'LD attorno a TCF7L2 (rs7903146)"}
+# Distanze (in basi) di tutti gli SNP nella regione TCF7L2 ± 200kb
+center_pos <- bim$pos[bim$rsID == "rs7903146"]
+window_idx <- which(abs(bim$pos - center_pos) <= 200000)
+window_pos <- bim$pos[window_idx]
+
+# r² di ogni SNP nella finestra rispetto a rs7903146
+r2_window <- sapply(window_idx, function(j) {
+  if (colnames(G)[j] == "rs7903146") return(1)
+  r <- cor(G[, "rs7903146"], G[, j], use = "pairwise.complete.obs")
+  r^2
+})
+
+ld_df <- data.frame(
+  dist_kb = (window_pos - center_pos) / 1000,
+  r2      = r2_window
+)
+
+ggplot(ld_df, aes(x = dist_kb, y = r2)) +
+  geom_point(alpha = 0.5, color = "#2c7fb8") +
+  geom_smooth(method = "loess", span = 0.3, color = "#d7191c", se = FALSE) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(
+    x = "Distanza da rs7903146 (kb)", y = "r²",
+    title = "Decadimento dell'LD attorno a TCF7L2",
+    subtitle = "Ogni punto è uno SNP nella finestra ±200 kb"
+  )
+```
+
+**Interpretazione:**
+
+- al centro ($r^2 = 1$ con sé stesso, ovviamente)
+- l'LD cala rapidamente fuori dal blocco simulato (~50 kb)
+- nel dato reale 1000G chr10 vedremo lo stesso pattern, con un blocco TCF7L2 vero esteso ~80 kb
+
+## LD heatmap della regione TCF7L2
+
+```{r ld-heatmap, fig.width=8, fig.height=7, fig.cap="LD heatmap di una regione di ~50 SNP intorno a rs7903146"}
+# Selezioniamo gli SNP del blocco
+heatmap_idx <- (tcf7l2_idx - 20):(tcf7l2_idx + 20)
+heatmap_idx <- heatmap_idx[heatmap_idx >= 1 & heatmap_idx <= n_snp]
+G_heat      <- G[, heatmap_idx]
+labels_heat <- colnames(G_heat)
+
+# Matrice di r² pairwise
+n_h <- length(heatmap_idx)
+ld_mat <- matrix(NA_real_, n_h, n_h)
+for (i in 1:n_h) for (j in 1:n_h) {
+  ld_mat[i, j] <- cor(G_heat[, i], G_heat[, j], use = "pairwise.complete.obs")^2
+}
+rownames(ld_mat) <- colnames(ld_mat) <- labels_heat
+
+# Plot con ggplot
+ld_long <- as.data.frame(as.table(ld_mat))
+colnames(ld_long) <- c("SNP1", "SNP2", "r2")
+ld_long$SNP1 <- factor(ld_long$SNP1, levels = labels_heat)
+ld_long$SNP2 <- factor(ld_long$SNP2, levels = rev(labels_heat))
+
+ggplot(ld_long, aes(x = SNP1, y = SNP2, fill = r2)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "#b30000",
+                      limits = c(0, 1), name = "r²") +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 7),
+    axis.text.y = element_text(size = 7),
+    panel.grid  = element_blank()
+  ) +
+  labs(
+    x = NULL, y = NULL,
+    title = "LD heatmap — regione TCF7L2",
+    subtitle = "Rosso intenso = r² alto; SNP centrale = rs7903146"
+  )
+```
+
+
+- il **quadrato rosso centrale** identifica il blocco aplotipico TCF7L2
+- gli SNP **fuori dal blocco** (angoli) sono bianchi → indipendenti
+- nel laboratorio, faremo la stessa cosa con `LDheatmap::LDheatmap()` che produce un grafico più curato
+
+---
+
+# 6. Identificare rs7903146 — il top SNP T2D
+
+Riassumiamo cosa sappiamo di **rs7903146** dopo questa lezione:
+
+```{r tcf7l2-summary}
+g <- G[, "rs7903146"]
+data.frame(
+  metrica = c(
+    "Posizione (chr10)",
+    "MAF",
+    "n_AA (omozigote ref)",
+    "n_Aa (eterozigote)",
+    "n_aa (omozigote alt)",
+    "HWE p-value",
+    "SNP in r² ≥ 0.8 nella regione"
+  ),
+  valore = c(
+    format(bim$pos[bim$rsID == "rs7903146"], big.mark = ","),
+    round(maf["rs7903146"], 3),
+    sum(g == 0, na.rm = TRUE),
+    sum(g == 1, na.rm = TRUE),
+    sum(g == 2, na.rm = TRUE),
+    formatC(hwe_p["rs7903146"], digits = 3, format = "g"),
+    sum(r2_window >= 0.8) - 1  # esclusione di sé stesso
+  )
+)
+```
+
+
+
+
+# Appendice — Comandi rapidi da ricordare
+
+| Operazione | Codice |
+|---|---|
+| Caricare PLINK | `dat <- genio::read_plink("T2D_chr10")` |
+| Estrarre matrice genotipi | `G <- dat$X` (n_snp × n_ind) |
+| Frequenza allele ALT | `freq <- colMeans(G, na.rm = TRUE) / 2` |
+| MAF | `maf <- pmin(freq, 1 - freq)` |
+| HWE p-value (singolo SNP) | vedi funzione `hwe_test` qui sopra |
+| LD pairwise r² | `cor(G[,i], G[,j], use="pairwise.complete.obs")^2` |
+| LD heatmap pronta | `LDheatmap::LDheatmap(snpStats_matrix)` |
+
+**Tutta la pipeline GWAS è una sequenza di operazioni su questa matrice `G`.** Da qui partiremo per tutto il resto del corso.

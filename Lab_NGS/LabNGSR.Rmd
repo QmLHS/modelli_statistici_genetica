@@ -1,8 +1,11 @@
 ---
 title: "Laboratorio · Gestione delle sequenze e analisi della qualità"
-subtitle: "Statistical Models for Genetics · 2 ore"
 author: "Modulo integrativo · companion del .pptx Lezione NGS"
+date: "`r Sys.Date()`"
 output:
+  pdf_document:
+    toc: true
+    toc_depth: '3'
   html_document:
     toc: true
     toc_float: true
@@ -12,7 +15,7 @@ output:
     highlight: tango
     code_folding: show
     df_print: paged
-date: "`r Sys.Date()`"
+subtitle: Statistical Models for Genetics · 2 ore
 ---
 
 ```{r setup, include = FALSE}
@@ -59,7 +62,7 @@ if (!has_biostrings) {
 
 ---
 
-# Blocco A · FASTQ in R, distribuzione empirica della qualità (30 min)
+# Blocco A · FASTQ in R, distribuzione empirica della qualità
 
 ## A.1 · Il formato, ricapitolato in tre righe
 
@@ -72,7 +75,7 @@ GATCAAATAGTAAATCCATTTGTTCAAC          ← sequenza
 !''*((((***+))%%%++)(%%%%).1***-+*''  ← qualità (ASCII)
 ```
 
-La riga 4 ha **esattamente la stessa lunghezza** della riga 2. Ogni carattere ASCII codifica un Phred score: `Q = ASCII − 33` (codifica Phred+33).
+La riga 4 ha **esattamente la stessa lunghezza** della riga 2. Ogni carattere ASCII codifica un Phred score: `Q = ASCII - 33` (codifica Phred+33).
 
 ## A.2 · Generiamo un FASTQ da zero (per controllo)
 
@@ -106,7 +109,8 @@ simulate_fastq <- function(n_reads = 1000, read_len = 100,
 
   # Genera sequenze A/C/G/T uniformi (per ora ignoriamo il bias di sequenza)
   bases <- matrix(sample(c("A", "C", "G", "T"), n_reads * read_len, replace = TRUE),
-                  nrow = n_reads, ncol = read_len)
+                  nrow = n_reads, ncol
+                  = read_len)
 
   list(
     seq = apply(bases, 1, paste0, collapse = ""),
@@ -205,7 +209,7 @@ if (requireNamespace("patchwork", quietly = TRUE)) {
 
 ---
 
-# Blocco B · Phred score, modelli statistici dietro e calibrazione (30 min)
+# Blocco B · Phred score, modelli statistici dietro e calibrazione
 
 ## B.1 · La formula e cosa significa davvero
 
@@ -253,7 +257,7 @@ simulate_with_errors <- function(truth, n_reads = 10000, read_len = 50) {
     # ogni base ha un Q assegnato dal basecaller. Distribuzione uniforme tra Q15 e Q40
     # (per esplorare tutto il range di calibrazione)
     Q_declared <- sample(15:40, read_len, replace = TRUE)
-    P_err      <- 10^(-Q_declared / 10)
+    P_err      <- 10^(-Q_declared / 10)#cambiare carattere!!
 
     # iniettiamo gli errori in modo onesto: il basecaller dichiara Q correttamente
     # questa è la condizione di CALIBRAZIONE PERFETTA
@@ -285,6 +289,12 @@ calib_data <- simulate_with_errors(truth_seq, n_reads = 5000, read_len = 50)
 head(calib_data, 8)
 ```
 
+
+```{r}
+aggregate(is_error ~ Q, data = calib_data, mean)
+```
+
+
 ## B.3 · Test di calibrazione
 
 ```{r calibration_plot}
@@ -292,12 +302,14 @@ head(calib_data, 8)
 calib_summary <- calib_data |>
   group_by(Q) |>
   summarise(
-    n_basi        = n(),
-    n_errori      = sum(is_error),
-    P_obs         = n_errori / n_basi,
-    P_declared    = 10^(-Q / 10),
-    Q_observed    = -10 * log10(pmax(P_obs, 1e-10)),
-    .groups = "drop"
+    n_basi     = n(),
+    n_errori   = sum(is_error),
+    P_obs      = n_errori / n_basi,
+    .groups    = "drop"
+  ) |>
+  mutate(
+    P_declared = 10^(-Q / 10),
+    Q_observed = -10 * log10(pmax(P_obs, 1e-10))
   )
 
 ggplot(calib_summary, aes(Q, Q_observed)) +
@@ -308,7 +320,7 @@ ggplot(calib_summary, aes(Q, Q_observed)) +
     title = "Calibrazione del Phred score (basecaller onesto)",
     subtitle = "Diagonale tratteggiata = calibrazione perfetta. Punti = osservato",
     x = "Q dichiarato dal basecaller",
-    y = "Q osservato = -10·log₁₀(P_errore_empirico)",
+    y = "Q osservato = -10·log_1_0(P_errore_empirico)",
     size = "Numero di basi"
   ) +
   theme_minimal(base_size = 11)
@@ -316,7 +328,7 @@ ggplot(calib_summary, aes(Q, Q_observed)) +
 
 I punti dovrebbero allinearsi sulla diagonale (con rumore campionario, soprattutto per Q alti dove gli errori osservati sono pochi). Adesso facciamo l'esercizio cattivo.
 
-## B.4 · Esercizio · un basecaller miscalibrato (15 min)
+## B.4 · Esercizio · un basecaller miscalibrato 
 
 Modificate `simulate_with_errors` per simulare un basecaller **ottimista** che dichiara `Q = Q_vero + 5` (sopravvaluta la qualità di 5 unità). Rifate il plot di calibrazione e quantificate **di quanto il basecaller mente**.
 
@@ -396,16 +408,27 @@ Adesso vediamo se è vero su dati simulati con bias realistico.
 #' Genera un mini-genoma con tre regioni a contenuto GC differente
 #' @return data.frame con position e gc (locale, finestra di 100 bp)
 simulate_minigenome <- function(length_bp = 10000) {
-  # Tre blocchi: GC normale, GC-rich (promotore), GC-low (intergenico)
-  region_size <- length_bp / 3
-  gc_probs <- c(rep(0.42, region_size),   # normale
-                rep(0.70, region_size),   # GC-rich
-                rep(0.25, region_size))   # AT-rich
-
+  # Tre blocchi: GC normale, GC-rich, GC-low
+  n1 <- floor(length_bp / 3)
+  n2 <- floor(length_bp / 3)
+  n3 <- length_bp - n1 - n2
+  
+  gc_probs <- c(
+    rep(0.42, n1),  # normale
+    rep(0.70, n2),  # GC-rich
+    rep(0.25, n3)   # AT-rich
+  )
+  
   bases <- character(length_bp)
+  
   for (i in seq_len(length_bp)) {
-    bases[i] <- if (runif(1) < gc_probs[i]) sample(c("G","C"), 1) else sample(c("A","T"), 1)
+    bases[i] <- if (runif(1) < gc_probs[i]) {
+      sample(c("G", "C"), 1)
+    } else {
+      sample(c("A", "T"), 1)
+    }
   }
+  
   paste(bases, collapse = "")
 }
 
@@ -516,7 +539,7 @@ bind_rows(
 
 **Nota tecnica.** Anche nel caso "senza bias" var/mean è leggermente > 1 (intorno a 1.3-1.5). Questo è atteso e non è un errore: le coperture di basi vicine sono correlate, perché un singolo read di 100 bp contribuisce contemporaneamente a 100 basi consecutive. La Poisson "vera" si avrebbe contando solo gli **inizi** dei reads in finestre disgiunte. Il punto pedagogico tiene comunque: con bias, var/mean esplode (ordine 10-20×), distinzione qualitativa netta dal caso senza bias.
 
-**Discussione.** Sotto Poisson, varianza ≈ media. Con bias, la varianza esplode: la copertura è **sovradispersa**, ben modellata da una **binomiale negativa** invece che da una Poisson. Questa è una proprietà universale dei dati di sequenziamento reali — il motivo per cui DESeq2 e edgeR usano NB per gli RNA-seq, non Poisson.
+**Discussione.** Sotto Poisson, varianza~ media. Con bias, la varianza esplode: la copertura è **sovradispersa**, ben modellata da una **binomiale negativa** invece che da una Poisson. Questa è una proprietà universale dei dati di sequenziamento reali — il motivo per cui DESeq2 e edgeR usano NB per gli RNA-seq, non Poisson.
 
 ## C.5 · Esercizio · 10 min
 
@@ -540,8 +563,8 @@ ll_nb <- -fit_nb$value; k_nb <- 2; aic_nb <- -2 * ll_nb + 2 * k_nb
 
 tibble::tibble(
   Modello = c("Poisson", "Binomiale negativa"),
-  parametri = c(sprintf("λ=%.2f", mle_pois),
-                sprintf("μ=%.2f, size=%.2f", fit_nb$par[1], fit_nb$par[2])),
+  parametri = c(sprintf("lambda=%.2f", mle_pois),
+                sprintf("mu=%.2f, size=%.2f", fit_nb$par[1], fit_nb$par[2])),
   logLik = c(ll_p, ll_nb),
   AIC = c(aic_p, aic_nb)
 ) |> knitr::kable(caption = "Confronto modelli sulla copertura con bias")
@@ -575,14 +598,14 @@ checklist <- tibble::tribble(
   "Per-sequence quality scores",         "I read 'cattivi' sono rari",                             "Picco a Q basso o bimodalità",
   "Per-base sequence quality",           "Q indipendente da posizione (i.i.d.)",                   "Calo prematuro, mediana < Q20 in zone",
   "Per-base sequence content",           "%A=%C=%G=%T per ogni posizione",                         "Adattatore residuo o bias inserzionale",
-  "Per-sequence GC content",             "GC ~ Normal(μ_atteso, σ_piccola)",                        "Bimodalità (contaminazione) o code lunghe",
+  "Per-sequence GC content",             "GC ~ Normal(mu_atteso, sigma_piccola)",                        "Bimodalità (contaminazione) o code lunghe",
   "Sequence Duplication Levels",         "Reads identici sono rari",                                "% dup > 20-30%, picco a duplicazione alta",
   "Adapter Content",                     "%adattatore ~ 0 alle posizioni finali",                  "Curva crescente verso 3'"
 )
 knitr::kable(checklist, caption = "Checklist di lettura statistica di un report FastQC/MultiQC")
 ```
 
-## D.3 · Esercizio guidato · 20 min
+## D.3 · Esercizio guidato
 
 Aprite il `multiqc_report.html` e per ciascuno dei 7 plot scrivete in una sentence:
 
