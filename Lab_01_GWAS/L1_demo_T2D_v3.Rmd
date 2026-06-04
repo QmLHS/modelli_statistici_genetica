@@ -1,0 +1,710 @@
+---
+title: "Lezione 1 — Demo R"
+subtitle: "MAF, HWE e LD su 1000 Genomes / chr10 / T2D"
+author: "Statistical Models for Genetics"
+date: "Master in Biostatistica"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    theme: paper
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 8, fig.height = 5, fig.align = "center",
+  dpi = 100
+)
+set.seed(20260101)
+```
+
+# Setup operativo
+
+## Come è strutturato il materiale
+
+Questa demo gira sul **dataset reale** T2D / chr10 simulato a partire da 1000 Genomes Phase 3. Il file di partenza è:
+
+```
+data/T2D_chr10_clean.{bed,bim,fam}
+```
+
+
+I dataset utilizzati:
+
+- **2504 individui** di 1000 Genomes Phase 3 (multi-ancestry: AFR, AMR, EAS, EUR, SAS)
+- **676.317 SNP** sul cromosoma 10 (dopo pre-filtraggio MAF > 0.01 e biallelici)
+- **Fenotipo T2D simulato** con GCTA: 250 casi, 2250 controlli, prevalenza ~10%, h² = 0.05
+- **3 causal SNP iniettati**: rs7903146 (TCF7L2, OR=1.37), rs1111875 (HHEX, OR=1.13), rs12779790 (CDC123, OR=1.11)
+
+## Pacchetti R richiesti
+
+```r
+# CRAN
+install.packages(c("genio", "ggplot2", "dplyr"))
+
+install.packages("remotes")
+remotes::install_github("SFUStatgen/LDheatmap")
+
+# Bioconductor
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install(c("snpStats", "SNPRelate"))
+```
+
+```{r libraries}
+library(genio)        # lettura PLINK
+library(snpStats)     # ispezione e LD
+library(LDheatmap)    # heatmap LD
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+theme_set(theme_minimal(base_size = 13))
+```
+
+---
+
+# 1. Caricamento del dataset
+
+## Lettura del trio PLINK con `genio`
+
+`genio::read_plink()` legge il `.bed/.bim/.fam` in un singolo passo. Per il chr10 (676k SNP × 2504 individui) impiega circa 30-60 secondi.
+
+```{r}
+setwd("/Users/annasandionigi/Documents/Courses/ModelliGenetici/materiale_demoR_modelli_statistici/")
+```
+
+
+```{r load-plink}
+plink_path <- "./data/T2D_chr10/T2D_chr10_clean"
+dat <- read_plink(plink_path)
+
+# Cosa contiene `dat`:
+str(dat, max.level = 1)
+```
+
+L'oggetto contiene tre componenti:
+
+- `X` — matrice di genotipi `n_snp × n_ind`, valori in {0, 1, 2, NA}
+- `bim` — data frame con info per-SNP
+- `fam` — data frame con info per-individuo
+
+```{r genotype-matrix-dim}
+G   <- dat$X
+bim <- dat$bim
+fam <- dat$fam
+
+cat(sprintf("Dimensioni di G: %s SNP × %s individui\n",
+            format(nrow(G), big.mark = ","),
+            format(ncol(G), big.mark = ",")))
+```
+
+**Nota sull'orientamento**: `genio` restituisce la matrice nella forma *SNP × individui* (righe = SNP, colonne = individui), che è la convenzione di PLINK. Nella maggior parte dei manuali di statistica genetica si usa la trasposta (individui × SNP). Per le formule che vedremo a lezione useremo *n_ind × n_snp*; quando serve, basta trasporre con `t()`.
+
+---
+
+# 2. Ispezione di `.bim` e `.fam`
+
+## `.bim` — informazioni per-SNP
+
+```{r bim-head}
+head(bim, 10)
+```
+
+**Cosa stiamo guardando**: ogni riga è uno SNP. Le colonne:
+
+- `chr` — cromosoma (10, in questo caso)
+- `id` — identificativo rsID (tutti gli SNP del nostro dataset hanno rsID, perché abbiamo filtrato i nameless in fase di preparazione)
+- `posg` — distanza genetica in centiMorgan (sempre 0, non usata)
+- `pos` — posizione fisica in basi (GRCh37)
+- `alt` — allele alternativo (A1 in PLINK)
+- `ref` — allele di riferimento (A2 in PLINK)
+
+## Ricerca del top SNP T2D — rs7903146 (TCF7L2)
+
+```{r find-tcf7l2}
+tcf7l2_row <- bim[bim$id == "rs7903146", ]
+tcf7l2_row
+```
+
+**Posizione canonica**: chr10:114.758.349 in GRCh37. Lo confermiamo.
+
+## `.fam` — informazioni per-individuo
+
+```{r fam-head}
+head(fam, 10)
+```
+
+**Codifica del fenotipo (caso-controllo)**:
+
+- `1` = controllo
+- `2` = caso
+- `0` o `-9` = mancante / non simulato
+
+```{r case-control-table}
+table(fam$pheno, dnn = "fenotipo T2D")
+```
+
+Confermati: ~250 casi, ~2250 controlli, qualche NA residuo della simulazione GCTA.
+
+## Pannello 1000G — super-popolazioni
+
+Carichiamo anche il pannello dei sample di 1000G, che ci dice da quale super-popolazione viene ogni individuo. Lo useremo nell'ultimo grafico.
+
+```{r load-panel}
+panel <- read.table("./data/integrated_call_samples_v3.20130502.ALL.panel",
+                    header = TRUE, stringsAsFactors = FALSE)
+fam$super_pop <- panel$super_pop[match(fam$id, panel$sample)]
+
+table(fam$super_pop, useNA = "ifany")
+```
+
+Cinque super-popolazioni rappresentate in modo bilanciato — questo darà problemi di stratificazione che vedremo alla Lezione 3.
+
+---
+
+# 3. Frequenze alleliche e MAF
+
+## Calcolo vettorializzato
+
+Per calcolare la frequenza dell'allele alternativo su tutti i 676k SNP usiamo l'identità: $p_{\text{ALT}} = \bar{G}_{\cdot j} / 2$, cioè **media della riga divisa per 2** (in `genio` le righe sono gli SNP).
+
+```{r maf-compute}
+# Frequenza dell'allele alternativo per ogni SNP
+freq_alt <- rowMeans(G, na.rm = TRUE) / 2
+
+# MAF
+maf <- pmin(freq_alt, 1 - freq_alt)
+
+summary(maf)
+```
+
+## Spettro delle frequenze alleliche
+
+Lo spettro è il grafico diagnostico fondamentale di ogni dataset GWAS.
+
+```{r maf-spectrum, fig.cap="Spettro della MAF su chr10 (1000G Phase 3 + filtro MAF > 0.01)"}
+ggplot(data.frame(maf = maf), aes(x = maf)) +
+  geom_histogram(bins = 60, fill = "#2c7fb8", color = "white") +
+  geom_vline(xintercept = c(0.01, 0.05), linetype = "dashed", color = "red") +
+  annotate("text", x = 0.06, y = Inf, label = "MAF = 0.05",
+           color = "red", vjust = 1.5, hjust = 0, size = 3.5) +
+  annotate("text", x = 0.02, y = Inf, label = "MAF = 0.01",
+           color = "red", vjust = 3, hjust = 0, size = 3.5) +
+  labs(
+    x = "MAF", y = "Numero di SNP",
+    title = "Spettro della Minor Allele Frequency — 1000G chr10",
+    subtitle = sprintf("%s SNP totali", format(length(maf), big.mark = ","))
+  )
+```
+
+**Interpretazione in aula**:
+
+- la **massa principale** è tra 0.05 e 0.50 → SNP comuni, fulcro dell'analisi GWAS
+- la **coda a sinistra** sotto 0.05 contiene SNP a bassa frequenza, da trattare con cautela
+- la forma decrescente "L" è tipica delle popolazioni umane — moltissime varianti rare, poche comuni — riflette la storia demografica della specie
+
+## Tabella per categoria
+
+```{r maf-categories}
+maf_class <- cut(maf,
+  breaks = c(-Inf, 0.01, 0.05, 0.5),
+  labels = c("rare (<1%)", "bassa freq. (1-5%)", "comuni (≥5%)")
+)
+data.frame(
+  classe = names(table(maf_class)),
+  N      = as.integer(table(maf_class)),
+  `%`    = round(100 * as.integer(table(maf_class)) / length(maf), 2)
+)
+```
+
+Sotto 0.01 abbiamo zero SNP per costruzione (filtraggio MAF > 0.01 in fase di preparazione). Tra 1% e 5% c'è una coda di varianti a bassa frequenza, e la maggior parte sono comuni.
+
+---
+
+# 4. Equilibrio di Hardy–Weinberg
+
+## Test χ² su un singolo SNP (calcolo manuale)
+
+Riprendiamo rs7903146 e calcoliamo HWE a mano, per fissare l'algebra:
+
+```{r hwe-manual}
+g_tcf <- G["rs7903146", ]
+n     <- sum(!is.na(g_tcf))
+
+# Conteggi genotipici
+o_AA  <- sum(g_tcf == 0, na.rm = TRUE)
+o_Aa  <- sum(g_tcf == 1, na.rm = TRUE)
+o_aa  <- sum(g_tcf == 2, na.rm = TRUE)
+
+# Frequenza allelica
+p     <- (2 * o_AA + o_Aa) / (2 * n)
+q     <- 1 - p
+
+# Frequenze attese sotto HWE
+e_AA  <- n * p^2
+e_Aa  <- n * 2 * p * q
+e_aa  <- n * q^2
+
+# χ²
+X2    <- (o_AA - e_AA)^2 / e_AA +
+         (o_Aa - e_Aa)^2 / e_Aa +
+         (o_aa - e_aa)^2 / e_aa
+
+p_val <- pchisq(X2, df = 1, lower.tail = FALSE)
+
+data.frame(
+  metrica    = c("n", "AA (oss.)", "Aa (oss.)", "aa (oss.)",
+                 "AA (att.)", "Aa (att.)", "aa (att.)",
+                 "MAF", "X²", "HWE p-value"),
+  valore     = c(n, o_AA, o_Aa, o_aa,
+                 round(e_AA,1), round(e_Aa,1), round(e_aa,1),
+                 round(min(p, q),3), round(X2,3),
+                 formatC(p_val, digits = 3))
+)
+```
+
+## Calcolo vettorializzato su tutti gli SNP — con `snpStats`
+
+Per fare HWE su 676k SNP in pochi secondi, ci affidiamo a `snpStats::col.summary()`. Per usarla servono i dati in formato `SnpMatrix` — la rilettiamo direttamente da `snpStats::read.plink()`, che usa un formato compatto (1 byte per genotipo) e non sfora mai la RAM:
+
+```{r hwe-snpstats}
+# read.plink legge direttamente in SnpMatrix (formato byte-packed, memoria minima)
+plink_data <- snpStats::read.plink(
+  bed = paste0(plink_path, ".bed"),
+  bim = paste0(plink_path, ".bim"),
+  fam = paste0(plink_path, ".fam")
+)
+snp_mat <- plink_data$genotypes   # già SnpMatrix
+cat(sprintf("SnpMatrix: %d individui × %d SNP, memoria ~%.1f MB\n",
+            nrow(snp_mat), ncol(snp_mat),
+            as.numeric(object.size(snp_mat)) / 1024^2))
+
+# Statistiche per SNP — include HWE z-score
+cs <- col.summary(snp_mat)
+
+# z di HWE → p-value (test bilaterale, chi-quadro a 1 gdl)
+hwe_p <- pchisq(cs$z.HWE^2, df = 1, lower.tail = FALSE)
+
+cat("\nDistribuzione HWE p-values:\n")
+print(summary(hwe_p))
+```
+
+## Distribuzione dei p-value di HWE
+
+Sotto $H_0$ (HWE vale ovunque) i p-value sono **uniformi su [0, 1]**.
+
+```{r hwe-pvalue-hist, fig.cap="P-value HWE — atteso ~uniforme sotto H₀"}
+ggplot(data.frame(p = hwe_p[!is.na(hwe_p)]), aes(x = p)) +
+  geom_histogram(bins = 50, fill = "#fdae61", color = "white") +
+  geom_hline(yintercept = sum(!is.na(hwe_p)) / 50, linetype = "dashed", color = "red") +
+  labs(
+    x = "p-value HWE", y = "Numero di SNP",
+    title = "Distribuzione dei p-value di Hardy–Weinberg — chr10",
+    subtitle = "Linea rossa = valore atteso sotto H₀ (uniforme)"
+  )
+```
+
+**Interpretazione**:
+
+- la distribuzione mostra un **eccesso vicino a 0** — perché?
+- nel nostro caso, ricordiamo che il dataset contiene **5 super-popolazioni mescolate**. Una popolazione strutturata (Wahlund effect) viola sistematicamente HWE → vediamo un'inflazione del test
+- in un dataset omogeneo per ancestry l'istogramma sarebbe piatto
+- **questo è uno dei motivi per cui il filtro HWE si applica per sub-popolazione, o dopo aver risolto la stratificazione (L3)**
+
+## Quanti SNP supererebbero la soglia GWAS standard ($p < 10^{-6}$)?
+
+```{r hwe-filter-count}
+n_hwe_fail <- sum(hwe_p < 1e-6, na.rm = TRUE)
+cat(sprintf("SNP che falliscono HWE a p < 1e-6: %s su %s totali (%.2f%%)\n",
+            format(n_hwe_fail, big.mark = ","),
+            format(sum(!is.na(hwe_p)), big.mark = ","),
+            100 * n_hwe_fail / sum(!is.na(hwe_p))))
+```
+
+Sono molti — perché il nostro dataset è multi-ancestry. Nel Lab 2 vedrete come questo numero scende drasticamente *dopo* aver risolto la stratificazione di popolazione.
+
+---
+
+# 5. Linkage Disequilibrium
+
+## r² tra due SNP — calcolo diretto
+
+```{r ld-manual}
+# rs7903146 e uno SNP molto vicino
+snp1 <- G["rs7903146", ]
+
+# Prendiamo lo SNP nella riga successiva del .bim (vicino fisicamente)
+neighbor_id  <- bim$id[which(bim$id == "rs7903146") + 1]
+snp2 <- G[neighbor_id, ]
+
+r  <- cor(snp1, snp2, use = "pairwise.complete.obs")
+r2 <- r^2
+
+cat(sprintf("r²(rs7903146, %s) = %.3f\n", neighbor_id, r2))
+```
+
+## Decadimento dell'LD intorno a TCF7L2
+
+Calcoliamo $r^2$ tra rs7903146 e tutti gli SNP in una finestra di ±200 kb, e plottiamo il decadimento.
+
+```{r ld-decay, fig.cap="Decadimento dell'LD attorno a TCF7L2 (rs7903146)"}
+center_pos <- bim$pos[bim$id == "rs7903146"]
+window_idx <- which(bim$chr == 10 & abs(bim$pos - center_pos) <= 200000)
+
+cat(sprintf("SNP nella finestra ±200 kb: %d\n", length(window_idx)))
+
+# r² rispetto a rs7903146
+tcf_geno <- G["rs7903146", ]
+r2_window <- sapply(window_idx, function(j) {
+  if (bim$id[j] == "rs7903146") return(1)
+  cor(tcf_geno, G[j, ], use = "pairwise.complete.obs")^2
+})
+
+ld_df <- data.frame(
+  dist_kb = (bim$pos[window_idx] - center_pos) / 1000,
+  r2      = r2_window
+)
+
+ggplot(ld_df, aes(x = dist_kb, y = r2)) +
+  geom_point(alpha = 0.3, color = "#2c7fb8", size = 0.7) +
+  geom_smooth(method = "loess", span = 0.2, color = "#d7191c", se = FALSE) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(
+    x = "Distanza da rs7903146 (kb)", y = "r²",
+    title = "Decadimento dell'LD attorno a TCF7L2",
+    subtitle = sprintf("Ogni punto è uno SNP nella finestra ±200 kb (%d SNP)", length(window_idx))
+  )
+```
+
+**Cosa mostrare in aula**:
+
+- al centro $r^2 = 1$ (lo SNP con sé stesso)
+- la nube cala fino a ~50 kb e poi diventa rumore
+- la curva LOESS (rossa) mostra il pattern medio del decadimento
+- **questo è il blocco LD di TCF7L2 in popolazione mista** — è esteso ~50 kb, coerente con la struttura LD aspettata
+
+## LD heatmap della regione TCF7L2 — con `snpStats`/`LDheatmap`
+
+```{r ld-heatmap, fig.width=8, fig.height=7, fig.cap="LD heatmap intorno a rs7903146 — 50 SNP nella regione"}
+# Selezioniamo 50 SNP intorno al top hit
+tcf_idx <- which(bim$id == "rs7903146")
+heatmap_idx <- (tcf_idx - 24):(tcf_idx + 25)
+heatmap_idx <- heatmap_idx[heatmap_idx >= 1 & heatmap_idx <= nrow(G)]
+
+# Estraiamo dalla SnpMatrix
+snp_mat_subset <- snp_mat[, heatmap_idx]
+
+# LDheatmap richiede SnpMatrix + posizioni fisiche
+LDheatmap(snp_mat_subset,
+          genetic.distances = bim$pos[heatmap_idx],
+          color = heat.colors(20),
+          title = "LD heatmap — regione TCF7L2 (rs7903146 ± 25 SNP)",
+          add.map = FALSE,
+          add.key = TRUE)
+```
+
+
+
+- il blocco di colore intenso al centro è il blocco aplotipico TCF7L2
+- gli angoli (SNP più lontani) hanno r² basso
+- nel Lab 1 confronterete questo blocco con un altro locus a vostra scelta — vedrete che blocchi diversi hanno dimensioni completamente diverse
+
+---
+
+# 6. Identificare rs7903146 — il top SNP T2D
+
+```{r tcf7l2-summary}
+g_tcf <- G["rs7903146", ]
+r2_high <- sum(r2_window >= 0.8) - 1  # esclude sé stesso
+
+data.frame(
+  metrica = c(
+    "Posizione (GRCh37)",
+    "MAF nel dataset (multi-ancestry)",
+    "N omozigote ref (CC)",
+    "N eterozigote (CT)",
+    "N omozigote alt (TT)",
+    "HWE p-value",
+    "SNP in r² ≥ 0.8 nella regione ±200 kb"
+  ),
+  valore = c(
+    format(bim$pos[bim$id == "rs7903146"], big.mark = ","),
+    round(maf[which(bim$id == "rs7903146")], 3),
+    sum(g_tcf == 0, na.rm = TRUE),
+    sum(g_tcf == 1, na.rm = TRUE),
+    sum(g_tcf == 2, na.rm = TRUE),
+    formatC(hwe_p[which(bim$id == "rs7903146")], digits = 3, format = "g"),
+    r2_high
+  )
+)
+```
+
+**Confronto con la letteratura**:
+
+- in popolazione **EUR** la MAF di rs7903146 è ~0.30 (allele T)
+- nel nostro dataset multi-ancestry la MAF è diversa (~0.23) perché AFR ha una frequenza del T più bassa
+- alla L4 testeremo l'associazione con T2D e troveremo OR ~1.37 (target della simulazione)
+
+---
+
+# 7. Preview di L3 — struttura di popolazione in 1000G
+
+Solo come anteprima visiva, calcoliamo le prime due componenti principali del nostro dataset e le coloriamo per super-popolazione. **Il metodo lo vedremo in dettaglio nelle prossime lezioni* — qui è solo per mostrarvi cosa c'è dentro i dati.
+
+```{r quick-pca, fig.cap="Preview: PC1 vs PC2 su 1000G chr10, colorata per super-popolazione"}
+# Per la velocità: PCA su un sottoinsieme casuale di 10k SNP comuni
+set.seed(20260101)
+
+# Stats per filtrare SNP comuni con basso missingness
+keep_snps <- which(cs$MAF >= 0.05 & cs$Call.rate >= 0.99)
+sample_idx <- sample(keep_snps, min(10000, length(keep_snps)))
+
+# Estraiamo il subset dalla SnpMatrix
+snp_sub <- snp_mat[, sample_idx]
+
+# snpStats ha una funzione efficiente per la matrice X X^T che ci serve per la PCA
+# Tratta automaticamente i NA come "imputati alla media" — perfetto per la preview
+xxt <- snpStats::xxt(snp_sub, correct.for.missing = TRUE)
+
+# Eigendecomposition di XX^T (più piccola: 2504 × 2504, gestibile)
+eig <- eigen(xxt, symmetric = TRUE)
+
+pc_df <- data.frame(
+  PC1 = eig$vectors[, 1],
+  PC2 = eig$vectors[, 2],
+  super_pop = fam$super_pop
+)
+
+ggplot(pc_df, aes(x = PC1, y = PC2, color = super_pop)) +
+  geom_point(alpha = 0.7, size = 1.5) +
+  scale_color_brewer(palette = "Set1", name = "Super-pop") +
+  labs(
+    title = "PCA preview — 1000G chr10",
+    subtitle = "PC1 separa AFR dagli altri; PC2 separa EAS da EUR/SAS/AMR",
+    x = "PC1", y = "PC2"
+  )
+```
+
+
+- vedete cluster chiaramente distinti per ancestry — questa è la **stratificazione di popolazione**
+- è la fonte principale di falsi positivi nei GWAS multi-ancestry
+- nella Lezione su dimensionality reduction impareremo a usare queste componenti come covariate nel modello per neutralizzarla
+
+---
+
+# 8. Proviamo a cambiare un po' le carte:
+
+Questo Lab consiste nel ripetere questa demo sui vostri laptop, con tre estensioni:
+
+1. **MAF stratificata per super-popolazione** (AFR, EAS, EUR, AMR, SAS). Vedrete che la MAF di rs7903146 è ~0.30 in EUR, ma ha valori molto diversi in altre popolazioni — perché?
+
+
+## 1a. Calcolo della MAF per ogni super-popolazione
+
+```{r ext1-maf-by-pop}
+
+# Le 5 super-popolazioni presenti nel dataset
+pops <- sort(unique(fam$super_pop[!is.na(fam$super_pop)]))
+cat("Super-popolazioni:", paste(pops, collapse = ", "), "\n")
+
+# Funzione: frequenza dell'allele alternativo per un sottoinsieme di individui
+#   G è snp × ind, quindi selezioniamo le COLONNE degli individui della pop
+freq_alt_in_pop <- function(pop_label) {
+  cols <- which(fam$super_pop == pop_label)
+  rowMeans(G[, cols], na.rm = TRUE) / 2
+}
+
+# Calcoliamo la freq ALT per ogni pop → matrice snp × pop
+freq_by_pop <- sapply(pops, freq_alt_in_pop)
+colnames(freq_by_pop) <- pops
+
+# MAF per pop (min(p, 1-p) applicato elemento per elemento)
+maf_by_pop <- pmin(freq_by_pop, 1 - freq_by_pop)
+
+# Anteprima
+head(maf_by_pop)
+```
+
+## 1b. Focus su rs7903146 (TCF7L2)
+
+```{r ext1-tcf7l2-focus}
+tcf_idx <- which(bim$id == "rs7903146")
+
+# Frequenza dell'allele ALT (= T, l'allele di rischio) per pop
+tcf_freq <- data.frame(
+  super_pop = pops,
+  freq_T    = round(freq_by_pop[tcf_idx, ], 3),
+  MAF       = round(maf_by_pop[tcf_idx, ], 3)
+)
+tcf_freq
+```
+
+```{r ext1-tcf7l2-plot, fig.cap="Frequenza dell'allele di rischio T (rs7903146) per super-popolazione"}
+ggplot(tcf_freq, aes(x = reorder(super_pop, freq_T), y = freq_T, fill = super_pop)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = sprintf("%.2f", freq_T)), vjust = -0.5, size = 4) +
+  scale_fill_brewer(palette = "Set2") +
+  ylim(0, max(tcf_freq$freq_T) * 1.15) +
+  labs(
+    x = "Super-popolazione", y = "Frequenza allele T (rischio)",
+    title = "rs7903146 (TCF7L2): l'allele di rischio varia molto tra popolazioni",
+    subtitle = "EUR ~0.30, ma EAS molto più bassa, AFR intermedia"
+  )
+```
+
+**Risposta alla domanda "perché?"** :
+
+La frequenza dell'allele di rischio di rs7903146 varia tra popolazioni per ragioni di **storia evolutiva e deriva genetica**. L'allele T è sorto in una popolazione ancestrale e la sua frequenza attuale riflette migrazioni, bottleneck demografici e (possibilmente) selezione locale. Questo ha due implicazioni dirette per il GWAS:
+
+1. **Confondimento da stratificazione**: se casi e controlli hanno proporzioni diverse di ancestry, una variante con frequenza diversa tra popolazioni può apparire associata alla malattia *anche se non lo è*. È il problema centrale delle prossime lezioni.
+
+2. **Portabilità dei risultati**: un OR stimato in EUR potrebbe non valere in EAS, sia perché la frequenza è diversa sia perché il pattern di LD con la variante causale cambia. Tema della L6 (PRS e portabilità).
+
+## 1c. Confronto visivo su un campione di SNP
+
+```{r ext1-maf-distributions, fig.cap="Distribuzione della MAF nelle 5 super-popolazioni (campione di 5000 SNP)"}
+set.seed(20260101)
+sample_snps <- sample(nrow(maf_by_pop), 5000)
+
+maf_long <- as.data.frame(maf_by_pop[sample_snps, ]) %>%
+  pivot_longer(everything(), names_to = "super_pop", values_to = "maf")
+
+ggplot(maf_long, aes(x = maf, fill = super_pop)) +
+  geom_density(alpha = 0.4) +
+  scale_fill_brewer(palette = "Set2", name = "Super-pop") +
+  labs(
+    x = "MAF", y = "Densità",
+    title = "Distribuzione della MAF per super-popolazione",
+    subtitle = "AFR ha tipicamente più varianti comuni (maggiore diversità genetica)"
+  )
+```
+
+AFR mostra in genere una distribuzione con più varianti comuni — riflette la maggiore diversità genetica delle popolazioni africane, conseguenza dell'origine africana della specie e del bottleneck "out of Africa" subito dalle altre popolazioni.
+
+---
+
+
+2. **Decadimento LD su un secondo locus** a vostra scelta. Provate con un SNP a caso fuori da TCF7L2 — vedrete blocchi LD di dimensioni completamente diverse.
+
+
+## 2a. Funzione riutilizzabile per il decadimento dell'LD
+
+```{r ext2-ld-function}
+# Calcola r² tra un SNP "indice" e tutti gli SNP nella finestra ±window_kb
+ld_decay_around <- function(index_id, window_kb = 200) {
+  idx <- which(bim$id == index_id)
+  if (length(idx) == 0) stop("SNP non trovato: ", index_id)
+
+  center_pos <- bim$pos[idx]
+  center_chr <- bim$chr[idx]
+  window_bp  <- window_kb * 1000
+
+  win_idx <- which(bim$chr == center_chr &
+                   abs(bim$pos - center_pos) <= window_bp)
+
+  index_geno <- G[idx, ]
+  r2 <- sapply(win_idx, function(j) {
+    if (j == idx) return(1)
+    cor(index_geno, G[j, ], use = "pairwise.complete.obs")^2
+  })
+
+  data.frame(
+    snp_id  = bim$id[win_idx],
+    dist_kb = (bim$pos[win_idx] - center_pos) / 1000,
+    r2      = r2
+  )
+}
+```
+
+## 2b. Confronto: TCF7L2 vs un secondo locus
+
+```{r ext2-pick-second-locus}
+# Scegliamo un secondo locus: prendiamo HHEX/IDE (rs1111875, altro causal T2D)
+# In alternativa gli studenti possono scegliere uno SNP a caso comune.
+
+# SNP indice 1: TCF7L2
+locus1_id <- "rs7903146"
+
+# SNP indice 2: HHEX (se presente), altrimenti uno SNP comune a caso sul chr10
+if ("rs1111875" %in% bim$id) {
+  locus2_id <- "rs1111875"
+  locus2_name <- "HHEX/IDE"
+} else {
+  set.seed(42)
+  common_snps <- bim$id[which(maf >= 0.2)]
+  locus2_id <- sample(common_snps, 1)
+  locus2_name <- "SNP casuale"
+}
+
+cat("Locus 1:", locus1_id, "(TCF7L2)\n")
+cat("Locus 2:", locus2_id, "(", locus2_name, ")\n")
+
+ld1 <- ld_decay_around(locus1_id, window_kb = 200)
+ld2 <- ld_decay_around(locus2_id, window_kb = 200)
+
+ld1$locus <- paste0(locus1_id, " (TCF7L2)")
+ld2$locus <- paste0(locus2_id, " (", locus2_name, ")")
+ld_both <- rbind(ld1, ld2)
+```
+
+```{r ext2-ld-comparison-plot, fig.cap="Decadimento LD a confronto su due loci diversi", fig.width=10}
+ggplot(ld_both, aes(x = dist_kb, y = r2)) +
+  geom_point(alpha = 0.3, color = "#2c7fb8", size = 0.7) +
+  geom_smooth(method = "loess", span = 0.2, color = "#d7191c", se = FALSE) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  facet_wrap(~ locus) +
+  labs(
+    x = "Distanza dallo SNP indice (kb)", y = "r²",
+    title = "Decadimento dell'LD: due loci, due strutture diverse",
+    subtitle = "Blocchi aplotipici di dimensioni differenti riflettono storie ricombinatorie diverse"
+  )
+```
+
+## 2c. Quantificare la dimensione del blocco LD
+
+```{r ext2-block-size}
+# Definiamo "dimensione del blocco" come l'estensione in kb entro cui r² >= 0.5
+block_extent <- function(ld_df, threshold = 0.5) {
+  high_ld <- ld_df[ld_df$r2 >= threshold & ld_df$dist_kb != 0, ]
+  if (nrow(high_ld) == 0) return(0)
+  diff(range(high_ld$dist_kb))
+}
+
+data.frame(
+  locus = c(paste0(locus1_id, " (TCF7L2)"),
+            paste0(locus2_id, " (", locus2_name, ")")),
+  n_snp_r2_over_0.8 = c(sum(ld1$r2 >= 0.8) - 1, sum(ld2$r2 >= 0.8) - 1),
+  block_kb_r2_over_0.5 = c(round(block_extent(ld1), 1),
+                           round(block_extent(ld2), 1))
+)
+```
+
+**Cosa osservare:** i due loci hanno blocchi di dimensioni diverse. Un blocco esteso indica una regione con poca ricombinazione storica (pochi hotspot); un blocco piccolo indica ricombinazione frequente. Questo ha conseguenze pratiche: in un blocco grande pochi tag SNP catturano tutta la regione, ma è più difficile fare fine-mapping (la variante causale è "nascosta" tra molti SNP correlati).
+
+---
+
+3. **Costruzione delle prime tre sezioni dello scheletro `.Rmd` di progetto**: caricamento, statistiche descrittive, plot di LD.
+
+Adesso tocca a voi usare il dataset HTN_chr16 e iniziare ad impostare il notebook per l'esame.
+
+
+---
+
+# Appendice — Comandi rapidi da ricordare
+
+| Operazione | Codice |
+|---|---|
+| Caricare PLINK | `dat <- genio::read_plink("path_senza_estensione")` |
+| Matrice genotipi | `G <- dat$X` (n_snp × n_ind) |
+| Frequenza allele ALT | `freq <- rowMeans(G, na.rm = TRUE) / 2` |
+| MAF | `maf <- pmin(freq, 1 - freq)` |
+| HWE su tutti gli SNP | `snpStats::col.summary(snp_mat)$z.HWE` |
+| LD pairwise r² | `cor(G[i, ], G[j, ], use = "pairwise.complete.obs")^2` |
+| LD heatmap pronta | `LDheatmap::LDheatmap(snp_mat[, idx], genetic.distances = pos[idx])` |
+
+**Tutta la pipeline GWAS è una sequenza di operazioni sulla matrice `G`.** Da qui partiremo per il resto del corso.
