@@ -1,0 +1,339 @@
+---
+title: "Esame — GWAS su ipertensione / chr16"
+subtitle: "Progetto d'esame — self-learning guidato"
+author: "Statistical Models for Genetics"
+date: "Master in Biostatistica"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    theme: paper
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 8, fig.height = 5, fig.align = "center", dpi = 100
+)
+set.seed(20260101)
+```
+
+
+# Istruzioni per l'esame
+
+Questo è il vostro progetto d'esame. Lavorate **a casa**, con tempo e fonti illimitate: potete consultare libri, articoli, documentazione, qualsiasi cosa. Quello che conta non è il codice — quello lo avete già visto tutto nella demo sul diabete — ma la vostra **comprensione** di cosa rappresentano le variabili, come funzionano gli algoritmi, e cosa può influenzare l'interpretazione dei risultati.
+
+**Il vostro caso**: un GWAS su un tratto cardiovascolare — la **pressione sistolica** — sul cromosoma 16. Il dataset è simulato a partire da 1000 Genomes, esattamente come il diabete che abbiamo visto a lezione. Sappiamo che il segnale principale atteso si trova in **regione FTO**, un gene molto studiato in ambito metabolico e cardiovascolare. Il vostro compito è far emergere quel segnale, interpretarlo, e documentarvi in autonomia sulla biologia.
+
+**Come consegnare**: eseguite ogni blocco di codice, osservate gli output, e rispondete alle domande di ragionamento (📝) inline. Alla fine trovate una griglia di sintesi numerata: quelle sono le domande su cui sarete valutati.
+
+> ⚠️ **Differenza importante rispetto al diabete**: la pressione sistolica è un **tratto quantitativo** (un numero in mmHg), non una variabile caso-controllo (malato/sano). Una delle cose che dovete capire è cosa cambia — e cosa NON cambia — nella pipeline quando il fenotipo è continuo invece che binario.
+
+---
+
+# 1. Caricamento del dataset
+
+```{r libraries}
+library(genio)
+library(snpStats)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+theme_set(theme_minimal(base_size = 13))
+```
+
+```{r load-plink}
+plink_path <- "./data/HTN_chr16/HTN_chr16_clean"
+dat <- read_plink(plink_path)
+
+G   <- dat$X
+bim <- dat$bim
+fam <- dat$fam
+
+cat(sprintf("Dimensioni di G: %s SNP × %s individui\n",
+            format(nrow(G), big.mark = ","),
+            format(ncol(G), big.mark = ",")))
+```
+
+📝 **Domanda 1.** La matrice `G` ha gli SNP sulle righe e gli individui sulle colonne. Se voleste calcolare la frequenza allelica per ogni SNP, su quale dimensione (righe o colonne) fareste la media? E perché la dividete per 2?
+
+
+---
+
+# 2. Ispezione di `.bim` e `.fam`
+
+```{r bim-fam-head}
+head(bim, 5)
+head(fam, 5)
+```
+
+## Il fenotipo: pressione sistolica
+
+```{r pheno-summary}
+summary(fam$pheno)
+cat(sprintf("\nN individui con fenotipo: %d\n", sum(!is.na(fam$pheno))))
+```
+
+```{r pheno-hist, fig.cap="Distribuzione del fenotipo (pressione sistolica simulata)"}
+ggplot(fam, aes(x = pheno)) +
+  geom_histogram(bins = 50, fill = "#7570b3", color = "white") +
+  geom_vline(xintercept = 140, linetype = "dashed", color = "red") +
+  annotate("text", x = 145, y = Inf, label = "soglia ipertensione (140)",
+           color = "red", hjust = 0, vjust = 1.5, size = 3.5) +
+  labs(x = "Pressione sistolica (mmHg)", y = "Numero di individui",
+       title = "Distribuzione del tratto")
+```
+
+📝 **Domanda 2.** Guardate l'istogramma del fenotipo e confrontatelo mentalmente con la tabella `casi/controlli` che avevamo nel diabete. Cosa è cambiato nella **natura della variabile risposta**? Che conseguenza ha questo sul **tipo di modello statistico** che dovrete usare nella sezione di associazione (sezione 6)?
+
+
+## Pannello 1000G — super-popolazioni
+
+```{r panel}
+panel <- read.table("./data/integrated_call_samples_v3.20130502.ALL.panel",
+                    header = TRUE, stringsAsFactors = FALSE)
+fam$super_pop <- panel$super_pop[match(fam$id, panel$sample)]
+table(fam$super_pop, useNA = "ifany")
+```
+
+📝 **Domanda 3.** Il dataset contiene 5 super-popolazioni mescolate, come nel diabete. Prima ancora di analizzare i dati, prevedete: questo fatto causerà problemi? Di che tipo? Citate almeno due fenomeni (visti a lezione) che vi aspettate di osservare a causa della struttura di popolazione.
+
+
+---
+
+# 3. Frequenze alleliche e MAF
+
+```{r maf}
+freq_alt <- rowMeans(G, na.rm = TRUE) / 2
+maf <- pmin(freq_alt, 1 - freq_alt)
+summary(maf)
+```
+
+```{r maf-spectrum, fig.cap="Spettro della MAF — chr16"}
+ggplot(data.frame(maf = maf), aes(x = maf)) +
+  geom_histogram(bins = 60, fill = "#2c7fb8", color = "white") +
+  geom_vline(xintercept = c(0.01, 0.05), linetype = "dashed", color = "red") +
+  labs(x = "MAF", y = "Numero di SNP", title = "Spettro della MAF — 1000G chr16")
+```
+
+📝 **Domanda 4.** Lo spettro della MAF ha la stessa forma "a L" che avete visto nel diabete. Questa forma dipende dalla **malattia** studiata, dal **cromosoma**, o da qualcos'altro? Argomentate.
+
+
+---
+
+# 4. Equilibrio di Hardy–Weinberg
+
+```{r hwe}
+n_AA <- rowSums(G == 0, na.rm = TRUE)
+n_Aa <- rowSums(G == 1, na.rm = TRUE)
+n_aa <- rowSums(G == 2, na.rm = TRUE)
+n_tot <- n_AA + n_Aa + n_aa
+
+p <- (2 * n_AA + n_Aa) / (2 * n_tot)
+e_AA <- n_tot * p^2
+e_Aa <- n_tot * 2 * p * (1 - p)
+e_aa <- n_tot * (1 - p)^2
+
+chi2 <- (n_AA-e_AA)^2/e_AA + (n_Aa-e_Aa)^2/e_Aa + (n_aa-e_aa)^2/e_aa
+chi2[!is.finite(chi2)] <- NA
+hwe_p <- pchisq(chi2, df = 1, lower.tail = FALSE)
+
+n_fail <- sum(hwe_p < 1e-6, na.rm = TRUE)
+cat(sprintf("SNP che falliscono HWE a p < 1e-6: %s su %s (%.2f%%)\n",
+            format(n_fail, big.mark = ","),
+            format(sum(!is.na(hwe_p)), big.mark = ","),
+            100 * n_fail / sum(!is.na(hwe_p))))
+```
+
+```{r hwe-hist, fig.cap="Distribuzione dei p-value di HWE — chr16"}
+ggplot(data.frame(p = hwe_p[!is.na(hwe_p)]), aes(x = p)) +
+  geom_histogram(bins = 50, fill = "#fdae61", color = "white") +
+  geom_hline(yintercept = sum(!is.na(hwe_p)) / 50, linetype = "dashed", color = "red") +
+  labs(x = "p-value HWE", y = "Numero di SNP",
+       title = "Distribuzione dei p-value di Hardy–Weinberg — chr16")
+```
+
+📝 **Domanda 5.** Anche qui vedete un eccesso di SNP con p-value HWE vicino a zero, come nel diabete. (a) Qual è la spiegazione più probabile, dato quello che sapete sul dataset? (b) Un vostro collega dice: "questi SNP sono fatti male, butto via tutti quelli che falliscono HWE". Perché questo ragionamento è pericoloso in un dataset come questo? (c) Quale sarebbe l'approccio corretto?
+
+
+---
+
+# 5. Linkage Disequilibrium nella regione FTO
+
+> Il segnale principale del vostro tratto è atteso in **regione FTO**, sul cromosoma 16. FTO è un gene noto in ambito metabolico. **Documentatevi**: cosa fa FTO? Perché potrebbe essere collegato alla pressione sanguigna? (ne riparliamo nella griglia finale)
+
+Per esplorare l'LD nella regione, individuiamo prima dove si trova FTO sul cromosoma 16. La regione canonica di FTO in GRCh37 è circa **chr16:53.7–54.1 Mb**.
+
+```{r ld-region}
+# Finestra centrata sulla regione FTO (GRCh37)
+fto_center <- 53800000
+window_idx <- which(bim$chr == 16 & abs(bim$pos - fto_center) <= 300000)
+cat(sprintf("SNP nella finestra FTO ±300 kb: %d\n", length(window_idx)))
+
+# SNP con MAF più alta nella regione, lo usiamo come "ancora" per l'LD
+anchor_local <- window_idx[which.max(maf[window_idx])]
+anchor_id <- bim$id[anchor_local]
+cat(sprintf("SNP ancora (MAF più alta nella regione): %s a pos %s\n",
+            anchor_id, format(bim$pos[anchor_local], big.mark = ",")))
+```
+
+```{r ld-decay, fig.cap="Decadimento dell'LD nella regione FTO"}
+anchor_geno <- G[anchor_local, ]
+r2_window <- sapply(window_idx, function(j) {
+  if (j == anchor_local) return(1)
+  cor(anchor_geno, G[j, ], use = "pairwise.complete.obs")^2
+})
+
+ld_df <- data.frame(
+  dist_kb = (bim$pos[window_idx] - bim$pos[anchor_local]) / 1000,
+  r2 = r2_window
+)
+
+ggplot(ld_df, aes(x = dist_kb, y = r2)) +
+  geom_point(alpha = 0.3, color = "#2c7fb8", size = 0.7) +
+  geom_smooth(method = "loess", span = 0.2, color = "#d7191c", se = FALSE) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(x = sprintf("Distanza da %s (kb)", anchor_id), y = "r²",
+       title = "Decadimento dell'LD nella regione FTO")
+```
+
+📝 **Domanda 6.** Confrontate la dimensione del blocco di LD che vedete qui con quella della regione TCF7L2 vista a lezione (~45 kb) e di HHEX (~217 kb). (a) Cosa determina la dimensione di un blocco di LD? (b) Se la regione FTO ha un blocco grande, che conseguenza ha questo sulla vostra capacità di identificare la **variante causale** una volta trovato il segnale?
+
+
+---
+
+# 6. Test di associazione — identificare il segnale
+
+Qui usate la regressione appropriata per un tratto **quantitativo**. Calcoliamo l'associazione SNP-by-SNP tra il genotipo e la pressione sistolica.
+
+```{r assoc, fig.cap="Manhattan plot — associazione con la pressione sistolica"}
+# Regressione lineare SNP-by-SNP (tratto quantitativo)
+# Per ogni SNP: pressione ~ genotipo. Estraiamo p-value e beta.
+pheno <- fam$pheno
+valid_pheno <- !is.na(pheno)
+
+# Vettorializzazione: per efficienza usiamo la correlazione come proxy del
+# test di regressione semplice (equivalente al p-value del t-test su beta)
+assoc_test <- function(g) {
+  ok <- !is.na(g) & valid_pheno
+  if (sum(ok) < 50 || sd(g[ok]) == 0) return(c(beta = NA, p = NA))
+  fit <- lm(pheno[ok] ~ g[ok])
+  s <- summary(fit)$coefficients
+  if (nrow(s) < 2) return(c(beta = NA, p = NA))
+  c(beta = s[2, 1], p = s[2, 4])
+}
+
+# Per velocità in classe: testiamo solo gli SNP comuni (MAF >= 0.05)
+test_idx <- which(maf >= 0.05)
+cat(sprintf("Testiamo %s SNP comuni...\n", format(length(test_idx), big.mark = ",")))
+
+res <- t(sapply(test_idx, function(j) assoc_test(G[j, ])))
+assoc <- data.frame(
+  id   = bim$id[test_idx],
+  pos  = bim$pos[test_idx],
+  beta = res[, "beta"],
+  p    = res[, "p"]
+)
+assoc <- assoc[!is.na(assoc$p), ]
+
+# Manhattan
+ggplot(assoc, aes(x = pos / 1e6, y = -log10(p))) +
+  geom_point(alpha = 0.4, size = 0.8, color = "#2c7fb8") +
+  geom_hline(yintercept = -log10(5e-8), linetype = "dashed", color = "red") +
+  annotate("text", x = max(assoc$pos/1e6), y = -log10(5e-8),
+           label = "5e-8", color = "red", hjust = 1, vjust = -0.5, size = 3) +
+  labs(x = "Posizione su chr16 (Mb)", y = expression(-log[10](p)),
+       title = "Manhattan plot — pressione sistolica / chr16")
+```
+
+```{r top-hits}
+# Top 10 SNP per significatività
+assoc[order(assoc$p), ][1:10, ]
+```
+
+📝 **Domanda 7.** Identificate il **top SNP** (quello con p-value più basso). (a) In che posizione si trova? Cade nella regione FTO attesa (chr16:53.7–54.1 Mb)? (b) Guardate il segno e il valore di `beta`: come interpretate clinicamente questo numero? (c) Cercate l'rsID del top SNP su un database pubblico (es. dbSNP, GWAS Catalog): risulta associato a tratti noti? Quali?
+
+
+📝 **Domanda 8.** Sulla soglia rossa di significatività genome-wide (5×10⁻⁸): da dove viene questo numero? Perché non si usa il classico 0.05? E nel nostro caso, stiamo testando solo il cromosoma 16 e non tutto il genoma — la soglia 5×10⁻⁸ è ancora appropriata, troppo severa, o troppo permissiva? Argomentate.
+
+
+---
+
+# 7. Diagnostica: QQ plot e lambda
+
+```{r qq, fig.cap="QQ plot dei p-value"}
+obs <- -log10(sort(assoc$p))
+exp <- -log10(ppoints(length(obs)))
+
+# Genomic inflation factor lambda_GC
+chisq_obs <- qchisq(assoc$p, df = 1, lower.tail = FALSE)
+lambda_gc <- median(chisq_obs, na.rm = TRUE) / qchisq(0.5, df = 1)
+
+ggplot(data.frame(exp = exp, obs = obs), aes(x = exp, y = obs)) +
+  geom_point(alpha = 0.4, size = 0.8, color = "#2c7fb8") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(x = expression(-log[10]("p attesi")), y = expression(-log[10]("p osservati")),
+       title = sprintf("QQ plot — λ_GC = %.3f", lambda_gc))
+```
+
+📝 **Domanda 9.** Il genomic inflation factor λ_GC vale `r round(0,3)` (leggetelo dal titolo del grafico). (a) Cosa misura λ_GC e cosa significa un valore > 1? (b) Nel nostro dataset multi-popolazione **senza** correzione per le componenti principali, vi aspettate λ_GC vicino a 1 o gonfiato? Perché? (c) Cosa fareste per riportarlo verso 1 (suggerimento: l'avete visto nella preview della demo T2D)?
+
+
+---
+
+# 8. Preview struttura di popolazione (PCA)
+
+```{r pca, fig.cap="PCA — struttura di popolazione su chr16"}
+plink_data <- snpStats::read.plink(
+  bed = paste0(plink_path, ".bed"),
+  bim = paste0(plink_path, ".bim"),
+  fam = paste0(plink_path, ".fam")
+)
+snp_mat <- plink_data$genotypes
+cs <- col.summary(snp_mat)
+
+set.seed(20260101)
+keep <- which(cs$MAF >= 0.05 & cs$Call.rate >= 0.99)
+sub_idx <- sample(keep, min(10000, length(keep)))
+xxt <- snpStats::xxt(snp_mat[, sub_idx], correct.for.missing = TRUE)
+eig <- eigen(xxt, symmetric = TRUE)
+
+pc_df <- data.frame(PC1 = eig$vectors[,1], PC2 = eig$vectors[,2],
+                    super_pop = fam$super_pop)
+ggplot(pc_df, aes(PC1, PC2, color = super_pop)) +
+  geom_point(alpha = 0.7, size = 1.5) +
+  scale_color_brewer(palette = "Set1", name = "Super-pop") +
+  labs(title = "PCA — 1000G chr16")
+```
+
+📝 **Domanda 10.** Collegate questo grafico PCA alla Domanda 9. In che modo i cluster che vedete qui spiegano il valore di λ_GC che avete osservato? E come userete concretamente queste componenti principali per correggere l'analisi?
+
+
+---
+
+# Griglia di sintesi — domande d'esame
+
+> Queste sono le domande su cui sarete valutati. Rispondete in modo argomentato, citando le fonti che avete consultato. Non c'è una sola risposta "giusta" — conta il ragionamento.
+
+**A. Sul tipo di dato e di modello**
+1. Perché per questo tratto si usa la regressione lineare e non logistica? Cosa cambierebbe nell'interpretazione dell'effetto?
+2. La forma dello spettro della MAF dipende dalla malattia studiata? Giustificate.
+
+**B. Sulla qualità e la struttura dei dati**
+3. Spiegate l'eccesso di violazioni di HWE in questo dataset e perché filtrarle ciecamente sarebbe sbagliato.
+4. Cosa è il genomic inflation factor e cosa vi dice il suo valore in questo dataset?
+
+**C. Sul segnale biologico**
+5. Qual è il top SNP che avete identificato, dove cade, e qual è il suo effetto stimato (con interpretazione clinica del beta)?
+6. **Documentazione autonoma**: cosa fa il gene FTO? È noto per la pressione sanguigna o per altro? Formulate un'ipotesi su *come* potrebbe influenzare la pressione (suggerimento: pensate a cosa media FTO e a quale fattore di rischio cardiovascolare).
+7. Il vostro top SNP, cercato nei database, risulta associato principalmente alla pressione o ad altro? Cosa implica questo per l'interpretazione causale del vostro risultato?
+
+**D. Sull'interpretazione e i limiti**
+8. La dimensione del blocco di LD nella regione FTO: come influenza la vostra capacità di identificare la variante causale?
+9. Elencate almeno tre cose che, in questa analisi, potrebbero portare a un'**interpretazione sbagliata** se non gestite correttamente.
+10. Se rifaceste questa analisi solo sugli individui europei, cosa vi aspettereste che cambi (nel λ_GC, nel numero di SNP che falliscono HWE, nella frequenza del top SNP)?
+
