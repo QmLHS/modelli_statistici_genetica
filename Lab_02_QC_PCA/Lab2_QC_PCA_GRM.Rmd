@@ -1,0 +1,757 @@
+---
+title: "Lab 2 — Quality Control, PCA e GRM"
+subtitle: "Dataset T2D / chr10 (versione noisy) — showcase"
+author: "Statistical Models for Genetics"
+date: "Master in Biostatistica"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: paper
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 8, fig.height = 5, fig.align = "center", dpi = 100
+)
+set.seed(20260101)
+```
+
+# Obiettivi del Lab 2
+
+In questa sessione facciamo girare **insieme** la pipeline di quality control completa su un dataset GWAS, dal dato grezzo "sporco" fino al dataset pulito pronto per l'analisi. Tutto il codice è esplicitato: voi seguite, prendete nota, e a casa lo rieseguite sui vostri portatili.
+
+**Cosa copriamo:**
+
+1. **Quality control sample-level**: call rate, eterozigosi, identificazione campioni problematici
+2. **Quality control variant-level**: call rate, MAF, Hardy–Weinberg, differential missingness
+3. **La tabella before/after** — il riassunto che va in ogni paper GWAS
+4. **Il log delle esclusioni** — tracciabilità di cosa abbiamo tolto e perché
+5. **PCA completa** per identificare la struttura di popolazione
+6. **Identificazione e rimozione degli outlier di ancestry**
+7. **Costruzione della GRM** (Genetic Relationship Matrix)
+
+**Il dataset**: `T2D_chr10_noisy`. È lo stesso caso del diabete della Lezione 1, ma in versione "sporca": abbiamo iniettato apposta dei problemi di qualità (missingness eterogenea, outlier di ancestry) per imparare a rilevarli e correggerli. Alla fine del lab avremo prodotto `T2D_chr10_qc` — la versione pulita.
+
+> ⚠️ **Filosofia del QC**: il quality control è letteralmente metà del lavoro di un GWAS reale. Un'analisi sofisticatissima su dati sporchi produce risultati spazzatura. Le soglie che useremo (call rate 95%, MAF 1%, HWE 1e-6) sono gli standard di letteratura — ma l'importante è capire *perché* esistono, non impararle a memoria.
+
+---
+
+# 0. Setup
+
+```{r libraries}
+library(genio)        # lettura PLINK
+library(snpStats)     # QC, statistiche, PCA via xxt
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+theme_set(theme_minimal(base_size = 13))
+```
+
+```{r load-data}
+plink_path <- "./data/T2D_chr10/T2D_chr10_noisy"
+
+# Carichiamo con genio per avere la matrice G esplicita (per i calcoli manuali)
+dat <- read_plink(plink_path)
+G   <- dat$X      # snp × ind
+bim <- dat$bim
+fam <- dat$fam
+
+# Carichiamo anche come SnpMatrix per le funzioni snpStats (col.summary, row.summary)
+plink_data <- snpStats::read.plink(
+  bed = paste0(plink_path, ".bed"),
+  bim = paste0(plink_path, ".bim"),
+  fam = paste0(plink_path, ".fam")
+)
+snp_mat <- plink_data$genotypes   # ind × snp (SnpMatrix)
+
+# Pannello 1000G per le super-popolazioni (servirà nella parte PCA)
+panel <- read.table("./data/integrated_call_samples_v3.20130502.ALL.panel",
+                    header = TRUE, stringsAsFactors = FALSE)
+fam$super_pop <- panel$super_pop[match(fam$id, panel$sample)]
+
+cat(sprintf("Dataset di partenza (noisy):\n"))
+cat(sprintf("  %s SNP × %s individui\n",
+            format(nrow(G), big.mark = ","),
+            format(ncol(G), big.mark = ",")))
+cat(sprintf("  Casi: %d | Controlli: %d\n",
+            sum(fam$pheno == 2, na.rm = TRUE),
+            sum(fam$pheno == 1, na.rm = TRUE)))
+```
+
+```{r init-tracking}
+# Inizializziamo le strutture per il TRACKING delle esclusioni.
+# Le aggiorneremo a ogni passo di QC per costruire log e tabella before/after.
+
+n_ind_start <- nrow(snp_mat)   # righe = individui
+n_snp_start <- ncol(snp_mat)   # colonne = SNP
+
+# Log delle esclusioni: una riga per ogni filtro applicato
+exclusion_log <- data.frame(
+  passo = character(), tipo = character(),
+  n_rimossi = integer(), n_rimasti = integer(),
+  stringsAsFactors = FALSE
+)
+
+log_step <- function(passo, tipo, n_rimossi, n_rimasti) {
+  exclusion_log <<- rbind(exclusion_log,
+    data.frame(passo = passo, tipo = tipo,
+               n_rimossi = n_rimossi, n_rimasti = n_rimasti,
+               stringsAsFactors = FALSE))
+}
+
+# Maschere booleane: TRUE = teniamo. Partono tutte TRUE.
+keep_snp <- rep(TRUE, n_snp_start)
+keep_ind <- rep(TRUE, n_ind_start)
+names(keep_snp) <- colnames(snp_mat)
+names(keep_ind) <- rownames(snp_mat)
+```
+
+---
+
+# 1. QC sample-level (sugli individui)
+
+Il primo blocco di filtri riguarda gli **individui**: vogliamo togliere le persone i cui dati genetici sono di scarsa qualità, perché un campione mal genotipizzato inquina tutta l'analisi.
+
+## 1.1 Statistiche per individuo
+
+`snpStats::row.summary()` calcola, per ogni individuo, le statistiche riassuntive sui suoi genotipi.
+
+```{r row-summary}
+rs <- row.summary(snp_mat)
+head(rs)
+```
+
+Le colonne che ci interessano:
+
+- `Call.rate` — proporzione di SNP genotipizzati con successo (1 − missing)
+- `Heterozygosity` — proporzione di genotipi eterozigoti dell'individuo
+
+## 1.2 Filtro per call rate (individui)
+
+Un individuo con molti genotipi mancanti è stato genotipizzato male. Soglia standard: **call rate ≥ 95%** (cioè meno del 5% di dati mancanti).
+
+```{r ind-callrate, fig.cap="Call rate per individuo — la linea rossa è la soglia 95%"}
+ind_callrate_threshold <- 0.95
+
+ggplot(data.frame(cr = rs$Call.rate), aes(x = cr)) +
+  geom_histogram(bins = 50, fill = "#2c7fb8", color = "white") +
+  geom_vline(xintercept = ind_callrate_threshold, linetype = "dashed", color = "red") +
+  labs(x = "Call rate", y = "Numero di individui",
+       title = "Call rate per individuo",
+       subtitle = "Gli individui a sinistra della linea rossa verranno esclusi")
+```
+
+```{r ind-callrate-filter}
+fail_callrate <- rs$Call.rate < ind_callrate_threshold
+n_fail_cr <- sum(fail_callrate & keep_ind)
+
+cat(sprintf("Individui con call rate < %.0f%%: %d\n",
+            ind_callrate_threshold * 100, n_fail_cr))
+
+keep_ind <- keep_ind & !fail_callrate
+log_step("Sample call rate < 0.95", "individui", n_fail_cr, sum(keep_ind))
+```
+
+## 1.3 Filtro per eterozigosi anomala
+
+L'eterozigosi di un individuo dovrebbe essere vicina alla media della popolazione. Valori **troppo alti** suggeriscono contaminazione del campione (DNA di due persone mescolato); valori **troppo bassi** suggeriscono consanguineità o problemi tecnici. Escludiamo chi è oltre **±3 deviazioni standard** dalla media.
+
+```{r ind-het, fig.cap="Eterozigosi per individuo — le linee rosse sono ±3 SD"}
+het_mean <- mean(rs$Heterozygosity, na.rm = TRUE)
+het_sd   <- sd(rs$Heterozygosity, na.rm = TRUE)
+het_lo   <- het_mean - 3 * het_sd
+het_hi   <- het_mean + 3 * het_sd
+
+ggplot(data.frame(het = rs$Heterozygosity), aes(x = het)) +
+  geom_histogram(bins = 50, fill = "#7570b3", color = "white") +
+  geom_vline(xintercept = c(het_lo, het_hi), linetype = "dashed", color = "red") +
+  labs(x = "Eterozigosità", y = "Numero di individui",
+       title = "Eterozigosità per individuo",
+       subtitle = sprintf("media %.3f, soglie a ±3 SD [%.3f, %.3f]",
+                          het_mean, het_lo, het_hi))
+```
+
+```{r ind-het-filter}
+fail_het <- rs$Heterozygosity < het_lo | rs$Heterozygosity > het_hi
+n_fail_het <- sum(fail_het & keep_ind)
+
+cat(sprintf("Individui con eterozigosità anomala (±3 SD): %d\n", n_fail_het))
+
+keep_ind <- keep_ind & !fail_het
+log_step("Eterozigosità outlier (±3 SD)", "individui", n_fail_het, sum(keep_ind))
+```
+
+> **Nota didattica**: spesso call rate ed eterozigosi si guardano insieme in uno scatter plot (heterozygosity vs missingness). Un individuo con alta missingness *e* eterozigosi anomala è quasi certamente un campione da scartare.
+
+```{r het-vs-miss, fig.cap="Eterozigosità vs missingness — lo scatter diagnostico classico"}
+diag_df <- data.frame(
+  miss = 1 - rs$Call.rate,
+  het  = rs$Heterozygosity,
+  stato = ifelse(fail_callrate | fail_het, "escluso", "tenuto")
+)
+ggplot(diag_df, aes(x = miss, y = het, color = stato)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c("escluso" = "#d7191c", "tenuto" = "#2c7fb8")) +
+  geom_vline(xintercept = 1 - ind_callrate_threshold, linetype = "dashed", color = "grey50") +
+  geom_hline(yintercept = c(het_lo, het_hi), linetype = "dashed", color = "grey50") +
+  labs(x = "Missingness (1 − call rate)", y = "Eterozigosità",
+       title = "Scatter diagnostico sample-level",
+       color = NULL)
+```
+
+---
+
+# 2. QC variant-level (sugli SNP)
+
+Ora i filtri sugli **SNP**. Importante: li calcoliamo **solo sugli individui che abbiamo tenuto** finora, perché le statistiche degli SNP cambiano quando rimuoviamo individui problematici.
+
+## 2.1 Statistiche per SNP (sui soli individui tenuti)
+
+```{r col-summary}
+# col.summary sugli individui sopravvissuti al QC sample-level
+cs <- col.summary(snp_mat[keep_ind, ])
+head(cs)
+```
+
+Colonne che useremo: `Call.rate` (call rate per SNP), `MAF`, `z.HWE` (z-score di Hardy–Weinberg).
+
+## 2.2 Filtro per call rate (SNP)
+
+Stesso principio degli individui: uno SNP genotipizzato male in troppi soggetti va tolto. Soglia: **call rate ≥ 95%**.
+
+```{r snp-callrate, fig.cap="Call rate per SNP"}
+snp_callrate_threshold <- 0.95
+
+ggplot(data.frame(cr = cs$Call.rate), aes(x = cr)) +
+  geom_histogram(bins = 50, fill = "#2c7fb8", color = "white") +
+  geom_vline(xintercept = snp_callrate_threshold, linetype = "dashed", color = "red") +
+  labs(x = "Call rate", y = "Numero di SNP",
+       title = "Call rate per SNP")
+```
+
+```{r snp-callrate-filter}
+fail_snp_cr <- cs$Call.rate < snp_callrate_threshold
+fail_snp_cr[is.na(fail_snp_cr)] <- TRUE
+n_fail_snp_cr <- sum(fail_snp_cr & keep_snp)
+
+cat(sprintf("SNP con call rate < %.0f%%: %s\n",
+            snp_callrate_threshold * 100, format(n_fail_snp_cr, big.mark = ",")))
+
+keep_snp <- keep_snp & !fail_snp_cr
+log_step("SNP call rate < 0.95", "SNP", n_fail_snp_cr, sum(keep_snp))
+```
+
+## 2.3 Filtro per MAF
+
+Le varianti troppo rare hanno potenza statistica insufficiente per il test single-SNP. Soglia: **MAF ≥ 0.01**.
+
+```{r snp-maf-filter}
+maf_threshold <- 0.01
+
+fail_maf <- cs$MAF < maf_threshold
+fail_maf[is.na(fail_maf)] <- TRUE
+# applichiamo solo agli SNP ancora in gioco
+n_fail_maf <- sum(fail_maf & keep_snp)
+
+cat(sprintf("SNP con MAF < %.2f: %s\n",
+            maf_threshold, format(n_fail_maf, big.mark = ",")))
+
+keep_snp <- keep_snp & !fail_maf
+log_step("SNP MAF < 0.01", "SNP", n_fail_maf, sum(keep_snp))
+```
+
+## 2.4 Filtro per Hardy–Weinberg
+
+Ricordate dalla Lezione 1: un SNP che viola HWE in modo grossolano è probabilmente un errore di genotipizzazione. Soglia standard GWAS: **p_HWE ≥ 1e-6**.
+
+> ⚠️ **Attenzione cruciale**: nei dataset caso-controllo, il filtro HWE si applica **solo nei controlli**. Perché? Una vera variante di rischio *può* violare HWE legittimamente nei casi (l'arricchimento di un genotipo nei malati distorce le frequenze). Filtrare nei casi rimuoverebbe proprio gli SNP che vogliamo trovare.
+
+```{r snp-hwe-filter}
+hwe_threshold <- 1e-6
+
+# HWE calcolato SOLO NEI CONTROLLI (pheno == 1), tra gli individui tenuti
+controls_idx <- which(fam$pheno == 1 & keep_ind)
+cs_controls <- col.summary(snp_mat[controls_idx, ])
+
+# z.HWE → p-value
+hwe_p_controls <- pchisq(cs_controls$z.HWE^2, df = 1, lower.tail = FALSE)
+
+fail_hwe <- hwe_p_controls < hwe_threshold
+fail_hwe[is.na(fail_hwe)] <- FALSE   # NA = monomorfici nei controlli, non li tocchiamo qui
+n_fail_hwe <- sum(fail_hwe & keep_snp)
+
+cat(sprintf("SNP con p_HWE < 1e-6 (nei controlli): %s\n",
+            format(n_fail_hwe, big.mark = ",")))
+
+keep_snp <- keep_snp & !fail_hwe
+log_step("SNP HWE p<1e-6 (controlli)", "SNP", n_fail_hwe, sum(keep_snp))
+```
+
+## 2.5 Differential missingness
+
+Filtro più sottile ma importante: uno SNP che è mancante **più spesso nei casi che nei controlli** (o viceversa) genera associazioni false. La missingness differenziale è una fonte classica di falsi positivi.
+
+```{r diff-missing}
+# Call rate dello SNP separatamente in casi e controlli (tra gli individui tenuti)
+cases_idx <- which(fam$pheno == 2 & keep_ind)
+ctrls_idx <- which(fam$pheno == 1 & keep_ind)
+
+cs_cases <- col.summary(snp_mat[cases_idx, ])
+cs_ctrls <- col.summary(snp_mat[ctrls_idx, ])
+
+# Test: differenza di missingness tra casi e controlli
+miss_cases <- 1 - cs_cases$Call.rate
+miss_ctrls <- 1 - cs_ctrls$Call.rate
+miss_diff  <- abs(miss_cases - miss_ctrls)
+
+# Soglia pragmatica: differenza di missingness > 2%
+diffmiss_threshold <- 0.02
+fail_diffmiss <- miss_diff > diffmiss_threshold
+fail_diffmiss[is.na(fail_diffmiss)] <- FALSE
+n_fail_diffmiss <- sum(fail_diffmiss & keep_snp)
+
+cat(sprintf("SNP con differential missingness > %.0f%%: %s\n",
+            diffmiss_threshold * 100, format(n_fail_diffmiss, big.mark = ",")))
+
+keep_snp <- keep_snp & !fail_diffmiss
+log_step("SNP differential missingness", "SNP", n_fail_diffmiss, sum(keep_snp))
+```
+
+```{r diff-missing-plot, fig.cap="Missingness nei casi vs nei controlli — punti rossi = differential missingness"}
+dm_df <- data.frame(
+  miss_ctrls = miss_ctrls,
+  miss_cases = miss_cases,
+  flag = ifelse(fail_diffmiss, "escluso", "ok")
+)
+# campioniamo per non appesantire il plot
+set.seed(1); dm_df <- dm_df[sample(nrow(dm_df), min(20000, nrow(dm_df))), ]
+
+ggplot(dm_df, aes(x = miss_ctrls, y = miss_cases, color = flag)) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  geom_abline(slope = 1, intercept = 0, color = "grey50", linetype = "dashed") +
+  scale_color_manual(values = c("escluso" = "#d7191c", "ok" = "#2c7fb8")) +
+  labs(x = "Missingness nei controlli", y = "Missingness nei casi",
+       title = "Differential missingness", color = NULL)
+```
+
+---
+
+# 3. La tabella before/after
+
+Questo è il riassunto che va in ogni paper GWAS: quanti SNP e quanti individui c'erano all'inizio, quanti ne abbiamo tolti a ogni passo, quanti ne restano.
+
+```{r exclusion-log-table}
+exclusion_log
+```
+
+```{r before-after-table}
+n_snp_end <- sum(keep_snp)
+n_ind_end <- sum(keep_ind)
+
+before_after <- data.frame(
+  Metrica = c("SNP", "Individui", "Casi", "Controlli"),
+  Prima = c(
+    format(n_snp_start, big.mark = ","),
+    n_ind_start,
+    sum(fam$pheno == 2, na.rm = TRUE),
+    sum(fam$pheno == 1, na.rm = TRUE)
+  ),
+  Dopo = c(
+    format(n_snp_end, big.mark = ","),
+    n_ind_end,
+    sum(fam$pheno == 2 & keep_ind, na.rm = TRUE),
+    sum(fam$pheno == 1 & keep_ind, na.rm = TRUE)
+  ),
+  Rimossi = c(
+    format(n_snp_start - n_snp_end, big.mark = ","),
+    n_ind_start - n_ind_end,
+    sum(fam$pheno == 2, na.rm = TRUE) - sum(fam$pheno == 2 & keep_ind, na.rm = TRUE),
+    sum(fam$pheno == 1, na.rm = TRUE) - sum(fam$pheno == 1 & keep_ind, na.rm = TRUE)
+  )
+)
+before_after
+```
+
+```{r before-after-plot, fig.cap="SNP rimossi a ogni passo del QC variant-level"}
+snp_steps <- exclusion_log[exclusion_log$tipo == "SNP", ]
+snp_steps$passo <- factor(snp_steps$passo, levels = snp_steps$passo)
+
+ggplot(snp_steps, aes(x = passo, y = n_rimossi)) +
+  geom_col(fill = "#d7191c", alpha = 0.8) +
+  geom_text(aes(label = format(n_rimossi, big.mark = ",")), vjust = -0.3, size = 3.5) +
+  labs(x = NULL, y = "SNP rimossi",
+       title = "SNP rimossi per ciascun filtro variant-level") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+---
+
+# 4. Applicare il QC: il dataset filtrato
+
+Adesso costruiamo il dataset pulito applicando le due maschere `keep_snp` e `keep_ind`.
+
+```{r apply-qc}
+snp_mat_qc <- snp_mat[keep_ind, keep_snp]
+fam_qc     <- fam[keep_ind, ]
+
+cat(sprintf("Dataset dopo QC:\n  %s SNP × %d individui\n",
+            format(ncol(snp_mat_qc), big.mark = ","),
+            nrow(snp_mat_qc)))
+```
+
+> A questo punto, in un workflow reale, salveremmo il dataset pulito su disco (es. `write.plink(...)`) come `T2D_chr10_qc`. Per il lab lo teniamo in memoria e proseguiamo con PCA e GRM.
+
+---
+
+# 5. PCA — struttura di popolazione
+
+Ora la parte di stratificazione. Calcoliamo le componenti principali sul dataset **dopo il QC**, per identificare la struttura di popolazione e gli outlier di ancestry.
+
+## 5.1 LD pruning (prima della PCA)
+
+> **Perché?** La PCA assume che le variabili (gli SNP) portino informazione indipendente. Gli SNP in forte LD sono ridondanti e possono distorcere le componenti (un blocco LD denso "tira" le PC verso di sé). Quindi prima della PCA si fa un **LD pruning**: si tiene un sottoinsieme di SNP approssimativamente indipendenti.
+
+```{r ld-pruning}
+# snpStats non ha un pruner integrato comodo; usiamo un pruning per finestre
+# basato sulla correlazione. Per semplicità e velocità nel lab, prendiamo
+# un sottocampione di SNP comuni e ben distanziati.
+
+cs_qc <- col.summary(snp_mat_qc)
+bim_qc <- bim[keep_snp, ]
+
+# Teniamo SNP comuni (MAF >= 0.05) e con call rate alto
+prune_candidates <- which(cs_qc$MAF >= 0.05 & cs_qc$Call.rate >= 0.99)
+
+# Pruning "fisico" semplice: 1 SNP ogni ~25 kb (proxy del pruning per LD)
+# (un vero LD pruning userebbe r²; qui usiamo la distanza per semplicità didattica)
+pos_candidates <- bim_qc$pos[prune_candidates]
+ord <- order(pos_candidates)
+prune_candidates <- prune_candidates[ord]
+pos_sorted <- pos_candidates[ord]
+
+keep_pruned <- logical(length(prune_candidates))
+last_pos <- -Inf
+for (i in seq_along(prune_candidates)) {
+  if (pos_sorted[i] - last_pos >= 25000) {
+    keep_pruned[i] <- TRUE
+    last_pos <- pos_sorted[i]
+  }
+}
+pruned_idx <- prune_candidates[keep_pruned]
+
+cat(sprintf("SNP dopo pruning per la PCA: %s (da %s comuni)\n",
+            format(length(pruned_idx), big.mark = ","),
+            format(length(prune_candidates), big.mark = ",")))
+```
+
+> **Nota**: qui usiamo un pruning "fisico" (1 SNP ogni 25 kb) per semplicità e velocità. In un'analisi reale si usa il pruning per **r²** (es. PLINK `--indep-pairwise 50 5 0.2`), che è più rigoroso. Il concetto è lo stesso: ridurre la ridondanza da LD.
+
+## 5.2 Calcolo delle componenti principali
+
+Usiamo lo stesso approccio della preview della Lezione 1: la matrice `xxt` (X·Xᵀ) e la sua decomposizione in autovettori.
+
+```{r pca-compute}
+snp_pca <- snp_mat_qc[, pruned_idx]
+
+# xxt calcola X X^T (matrice ind × ind), gestendo i missing come media
+xxt <- snpStats::xxt(snp_pca, correct.for.missing = TRUE)
+
+# Eigendecomposition
+eig <- eigen(xxt, symmetric = TRUE)
+
+# Le prime PC sono gli autovettori principali
+n_pc <- 10
+pcs <- eig$vectors[, 1:n_pc]
+colnames(pcs) <- paste0("PC", 1:n_pc)
+
+# Varianza spiegata da ciascuna PC
+var_explained <- eig$values[1:n_pc] / sum(eig$values)
+
+pc_df <- data.frame(pcs, super_pop = fam_qc$super_pop,
+                    pheno = factor(fam_qc$pheno))
+```
+
+## 5.3 Scree plot — quante PC tenere?
+
+```{r scree, fig.cap="Scree plot — varianza spiegata dalle prime 10 PC"}
+scree_df <- data.frame(PC = 1:n_pc, var = var_explained * 100)
+ggplot(scree_df, aes(x = PC, y = var)) +
+  geom_col(fill = "#2c7fb8") +
+  geom_line(color = "#d7191c") + geom_point(color = "#d7191c") +
+  scale_x_continuous(breaks = 1:n_pc) +
+  labs(x = "Componente principale", y = "Varianza spiegata (%)",
+       title = "Scree plot",
+       subtitle = "Il 'gomito' indica quante PC catturano la struttura principale")
+```
+
+📌 **Lettura**: le prime PC (di solito 2-4) catturano la struttura di ancestry; dopo il "gomito" le PC catturano rumore. Come covariate nel GWAS (Lezione 4) si usano in genere le prime 10 per sicurezza.
+
+## 5.4 PC1 vs PC2 colorate per super-popolazione
+
+```{r pca-plot, fig.cap="PC1 vs PC2 colorate per super-popolazione"}
+ggplot(pc_df, aes(x = PC1, y = PC2, color = super_pop)) +
+  geom_point(alpha = 0.7, size = 1.5) +
+  scale_color_brewer(palette = "Set1", name = "Super-pop") +
+  labs(title = "PCA — struttura di popolazione (dopo QC)",
+       subtitle = "PC1 separa AFR; PC2 separa EAS dagli altri")
+```
+
+---
+
+# 6. Identificazione e rimozione degli outlier di ancestry
+
+Nel dataset noisy abbiamo iniettato apposta degli **outlier di ancestry**: individui di popolazione diversa dalla maggioritaria. Sulla PCA si vedono come punti lontani dal cluster principale. Li identifichiamo e li rimuoviamo, perché in un GWAS la stratificazione residua genera falsi positivi.
+
+## 6.1 Definire la popolazione "core"
+
+> **Scelta analitica**: in un GWAS reale si decide a quale popolazione restringere l'analisi (es. "teniamo solo gli europei"). Qui, a scopo didattico, definiamo come "core" la popolazione maggioritaria e trattiamo le altre come outlier da rimuovere — è il caso più semplice di controllo della stratificazione.
+
+```{r define-core}
+core_pop <- names(sort(table(fam_qc$super_pop), decreasing = TRUE))[1]
+cat(sprintf("Popolazione core (maggioritaria): %s\n", core_pop))
+```
+
+## 6.2 Identificare gli outlier sulle PC
+
+Definiamo outlier chi è oltre **±6 SD** dalla media delle prime due PC (criterio standard). In un dataset con popolazione core dominante, questo cattura gli individui di ancestry diversa.
+
+```{r identify-outliers}
+sd_threshold <- 6
+
+pc1_mean <- mean(pcs[, 1]); pc1_sd <- sd(pcs[, 1])
+pc2_mean <- mean(pcs[, 2]); pc2_sd <- sd(pcs[, 2])
+
+outlier_pca <- abs(pcs[, 1] - pc1_mean) > sd_threshold * pc1_sd |
+               abs(pcs[, 2] - pc2_mean) > sd_threshold * pc2_sd
+
+# Approccio alternativo (più robusto qui, dato che le pop sono molto separate):
+# marchiamo come outlier chi NON appartiene alla popolazione core.
+outlier_ancestry <- fam_qc$super_pop != core_pop
+
+cat(sprintf("Outlier per criterio ±6 SD sulle PC: %d\n", sum(outlier_pca)))
+cat(sprintf("Individui non-core (ancestry diversa da %s): %d\n",
+            core_pop, sum(outlier_ancestry, na.rm = TRUE)))
+```
+
+> **Nota didattica**: i due criteri (±6 SD sulle PC vs appartenenza alla popolazione core) danno risultati diversi. Il criterio SD è "data-driven" ma in un dataset così strutturato può non separare bene; il criterio per ancestry nota è più netto ma richiede l'etichetta di popolazione. Nella pratica reale, dove non si hanno etichette perfette, si usa il criterio sulle PC iterativamente. Qui, avendo le etichette 1000G, usiamo l'appartenenza alla core per pulizia didattica.
+
+```{r outlier-plot, fig.cap="Outlier di ancestry evidenziati sulla PCA"}
+pc_df$outlier <- outlier_ancestry
+ggplot(pc_df, aes(x = PC1, y = PC2, color = outlier)) +
+  geom_point(alpha = 0.7, size = 1.5) +
+  scale_color_manual(values = c("FALSE" = "#2c7fb8", "TRUE" = "#d7191c"),
+                     labels = c("FALSE" = "core (tenuto)", "TRUE" = "outlier (rimosso)"),
+                     name = NULL) +
+  labs(title = "Outlier di ancestry da rimuovere",
+       subtitle = sprintf("Popolazione core: %s", core_pop))
+```
+
+## 6.3 Rimuovere gli outlier
+
+```{r remove-outliers}
+keep_after_pca <- !outlier_ancestry
+keep_after_pca[is.na(keep_after_pca)] <- FALSE
+
+n_outlier <- sum(!keep_after_pca)
+cat(sprintf("Outlier di ancestry rimossi: %d\n", n_outlier))
+
+snp_mat_final <- snp_mat_qc[keep_after_pca, ]
+fam_final     <- fam_qc[keep_after_pca, ]
+
+log_step("Outlier di ancestry (PCA)", "individui", n_outlier, nrow(snp_mat_final))
+
+cat(sprintf("\nDataset finale (post-QC + post-ancestry):\n  %s SNP × %d individui\n",
+            format(ncol(snp_mat_final), big.mark = ","),
+            nrow(snp_mat_final)))
+cat(sprintf("  Casi: %d | Controlli: %d\n",
+            sum(fam_final$pheno == 2, na.rm = TRUE),
+            sum(fam_final$pheno == 1, na.rm = TRUE)))
+```
+
+## 6.4 PCA ricalcolata sul dataset pulito
+
+Dopo aver rimosso gli outlier, ricalcoliamo la PCA: ora le PC catturano la struttura *fine* dentro la popolazione core, non più la macro-separazione tra popolazioni.
+
+```{r pca-recompute, fig.cap="PCA dopo la rimozione degli outlier di ancestry"}
+# Pruning sul dataset finale
+cs_final <- col.summary(snp_mat_final)
+common_final <- which(cs_final$MAF >= 0.05 & cs_final$Call.rate >= 0.99)
+set.seed(20260101)
+sub_final <- sample(common_final, min(20000, length(common_final)))
+
+xxt_final <- snpStats::xxt(snp_mat_final[, sub_final], correct.for.missing = TRUE)
+eig_final <- eigen(xxt_final, symmetric = TRUE)
+pcs_final <- eig_final$vectors[, 1:n_pc]
+colnames(pcs_final) <- paste0("PC", 1:n_pc)
+
+pc_final_df <- data.frame(pcs_final,
+                          super_pop = fam_final$super_pop,
+                          pheno = factor(fam_final$pheno))
+
+ggplot(pc_final_df, aes(x = PC1, y = PC2, color = pheno)) +
+  geom_point(alpha = 0.7, size = 1.5) +
+  scale_color_manual(values = c("1" = "#2c7fb8", "2" = "#d7191c"),
+                     labels = c("1" = "controllo", "2" = "caso"), name = NULL) +
+  labs(title = "PCA dopo rimozione outlier — colorata per fenotipo",
+       subtitle = "Ora niente macro-cluster: la struttura residua è fine")
+```
+
+📌 **Cosa osservare**: dopo la rimozione, non ci sono più cluster netti per popolazione. Se i casi e i controlli (colori) si sovrappongono bene, è un buon segno: vuol dire che non c'è confondimento residuo grossolano tra fenotipo e struttura genetica. Queste PC finali sono quelle che useremo come covariate nel GWAS della Lezione 4.
+
+---
+
+# 7. GRM — Genetic Relationship Matrix
+
+La GRM quantifica la **parentela genetica** tra ogni coppia di individui. Serve a due cose: (1) identificare individui imparentati o duplicati (da rimuovere o modellare), (2) come input per i modelli misti (mixed models) che vedremo più avanti.
+
+## 7.1 Costruzione della GRM
+
+La GRM è essenzialmente la matrice X·Xᵀ standardizzata — la stessa `xxt` che abbiamo usato per la PCA, ma normalizzata in modo da rappresentare la correlazione genetica tra individui.
+
+```{r grm-compute}
+# Usiamo gli SNP comuni del dataset finale, standardizzati
+# La GRM standard (VanRaden / GCTA) usa: G = Z Z' / m, con Z genotipi
+# centrati e scalati per la frequenza allelica.
+
+# Estraiamo i genotipi come matrice numerica (ind × snp)
+G_final <- as(snp_mat_final[, sub_final], "numeric")  # 0/1/2, NA possibili
+
+# Imputazione semplice dei missing con la media di colonna
+col_means <- colMeans(G_final, na.rm = TRUE)
+for (j in seq_len(ncol(G_final))) {
+  na_j <- is.na(G_final[, j])
+  if (any(na_j)) G_final[na_j, j] <- col_means[j]
+}
+
+# Standardizzazione per SNP: (g - 2p) / sqrt(2p(1-p))
+p_hat <- col_means / 2
+denom <- sqrt(2 * p_hat * (1 - p_hat))
+denom[denom == 0] <- 1  # evita divisione per zero su SNP monomorfici
+Z <- sweep(G_final, 2, 2 * p_hat, "-")
+Z <- sweep(Z, 2, denom, "/")
+
+# GRM = Z Z' / m
+m <- ncol(Z)
+GRM <- (Z %*% t(Z)) / m
+
+cat(sprintf("GRM: matrice %d × %d (individui)\n", nrow(GRM), ncol(GRM)))
+```
+
+## 7.2 Interpretazione della diagonale e fuori-diagonale
+
+```{r grm-interpret}
+# Diagonale: ~1 + inbreeding. Valori molto sopra 1 = possibile inbreeding/problema.
+diag_grm <- diag(GRM)
+
+# Fuori-diagonale: parentela tra coppie. ~0 = non imparentati.
+# ~0.5 = parenti di primo grado (genitore-figlio, fratelli); ~1 = duplicati/gemelli.
+offdiag <- GRM[upper.tri(GRM)]
+
+cat("Diagonale della GRM (self-relatedness):\n")
+print(summary(diag_grm))
+cat("\nFuori-diagonale (parentela tra coppie):\n")
+print(summary(offdiag))
+```
+
+```{r grm-offdiag-plot, fig.cap="Distribuzione della parentela fuori-diagonale"}
+ggplot(data.frame(rel = offdiag), aes(x = rel)) +
+  geom_histogram(bins = 80, fill = "#2c7fb8", color = "white") +
+  geom_vline(xintercept = c(0.125, 0.25, 0.5), linetype = "dashed", color = "red") +
+  annotate("text", x = 0.25, y = Inf, label = "parenti", color = "red",
+           hjust = 0, vjust = 1.5, size = 3) +
+  labs(x = "Coefficiente di parentela (GRM off-diagonal)", y = "Numero di coppie",
+       title = "Distribuzione della parentela tra coppie",
+       subtitle = "Picco vicino a 0 = popolazione di non imparentati (atteso in 1000G)")
+```
+
+📌 **Lettura**: in 1000G gli individui sono in larga parte non imparentati, quindi la fuori-diagonale è concentrata vicino a zero. Eventuali coppie con parentela > 0.125 (parenti di terzo grado o più stretti) andrebbero gestite: in un GWAS standard se ne rimuove uno della coppia; in un mixed model si modella la GRM direttamente.
+
+## 7.3 Heatmap della GRM (campione)
+
+```{r grm-heatmap, fig.width=7, fig.height=6, fig.cap="Heatmap della GRM su un campione di 100 individui"}
+set.seed(1)
+samp <- sample(nrow(GRM), min(100, nrow(GRM)))
+grm_sub <- GRM[samp, samp]
+
+grm_long <- as.data.frame(as.table(grm_sub))
+colnames(grm_long) <- c("ind1", "ind2", "rel")
+
+ggplot(grm_long, aes(x = ind1, y = ind2, fill = rel)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "#2c7fb8", mid = "white", high = "#d7191c",
+                       midpoint = 0, name = "Parentela") +
+  labs(title = "GRM — heatmap (100 individui campionati)",
+       x = NULL, y = NULL) +
+  theme(axis.text = element_blank(), axis.ticks = element_blank())
+```
+
+📌 **Lettura**: la diagonale (in rosso) è la self-relatedness ~1. Il resto della matrice è prevalentemente chiaro (parentela ~0), coerente con una popolazione di non imparentati. Macchie rosse fuori diagonale indicherebbero coppie di parenti.
+
+---
+
+# 8. Riepilogo finale
+
+```{r final-summary}
+cat("=== RIEPILOGO LAB 2 — QC + PCA + GRM ===\n\n")
+cat(sprintf("Dataset di partenza:  %s SNP × %d individui\n",
+            format(n_snp_start, big.mark = ","), n_ind_start))
+cat(sprintf("Dopo QC variant+sample: %s SNP × %d individui\n",
+            format(sum(keep_snp), big.mark = ","), sum(keep_ind)))
+cat(sprintf("Dopo rimozione outlier: %s SNP × %d individui\n\n",
+            format(ncol(snp_mat_final), big.mark = ","), nrow(snp_mat_final)))
+
+cat("Log completo delle esclusioni:\n")
+print(exclusion_log)
+
+cat(sprintf("\nProdotti del lab pronti per la Lezione 4 (GWAS):\n"))
+cat("  - snp_mat_final : dataset pulito\n")
+cat("  - pcs_final     : 10 PC da usare come covariate\n")
+cat("  - GRM           : matrice di parentela per i mixed model\n")
+```
+
+---
+
+# Cosa fare a casa
+
+Rieseguite questo intero notebook sui vostri portatili, sul dataset `T2D_chr10_noisy`, e assicuratevi di capire **a ogni passo**:
+
+1. **Quale statistica** stiamo calcolando (call rate, eterozigosi, MAF, HWE, missingness differenziale)
+2. **Quale soglia** applichiamo e **perché** quel valore
+3. **Cosa cambia** nella tabella before/after a ogni filtro
+4. **Perché** la PCA va fatta dopo il QC e dopo il pruning
+5. **Cosa rappresentano** le PC e la GRM, e a cosa serviranno nella Lezione 4
+
+Nel vostro `.Rmd` di progetto, questa diventa la **Sezione 4 (Quality Control)** e la **Sezione 5 (PCA + GRM)**.
+
+---
+
+# Appendice — Comandi rapidi del QC
+
+| Operazione | Funzione |
+|---|---|
+| Statistiche per individuo | `snpStats::row.summary(snp_mat)` |
+| Statistiche per SNP | `snpStats::col.summary(snp_mat)` |
+| Call rate individuo/SNP | colonna `Call.rate` |
+| Eterozigosi | colonna `Heterozygosity` (row.summary) |
+| MAF | colonna `MAF` (col.summary) |
+| HWE z-score | colonna `z.HWE` (col.summary) → `pchisq(z^2, 1, lower=F)` |
+| PCA (X Xᵀ) | `snpStats::xxt(snp_mat, correct.for.missing=TRUE)` poi `eigen()` |
+| GRM standardizzata | `Z Z' / m` con `Z` = genotipi centrati/scalati per `2p(1-p)` |
+
+**Soglie standard usate:**
+
+| Filtro | Soglia |
+|---|---|
+| Call rate (individui) | ≥ 0.95 |
+| Eterozigosi | entro ±3 SD |
+| Call rate (SNP) | ≥ 0.95 |
+| MAF | ≥ 0.01 |
+| HWE (nei controlli) | p ≥ 1e-6 |
+| Differential missingness | < 2% |
+| Outlier ancestry | oltre core / ±6 SD su PC |
